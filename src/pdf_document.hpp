@@ -21,6 +21,10 @@ public:
 
 	int pageCount() const;
 
+	void pageSize(int pageNumber, float* widthPts, float* heightPts) const;
+	/* Native page size in PDF points (1/72 inch), without rasterizing it. Throws
+	 * std::runtime_error on failure. */
+
 	std::vector<uint8_t> renderPagePng(int pageNumber, float targetWidthPx) const;
 	/* Rasterizes the given 0-indexed page to a PNG image scaled so its width matches
 	 * targetWidthPx (height follows the page's aspect ratio). Throws std::runtime_error

@@ -1,6 +1,7 @@
 #include <hipe.h>
 #include "pdf_document.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -12,23 +13,30 @@
 #define REQ_NEXT 2
 #define REQ_ZOOM_OUT 3
 #define REQ_ZOOM_IN 4
+#define REQ_FIT_WIDTH 5
+#define REQ_FIT_PAGE 6
 #define REQ_THUMB_BASE 1000
 
 static const float THUMB_WIDTH_PX = 110.0f;
 static const float ZOOM_MIN = 0.25f;
 static const float ZOOM_MAX = 4.0f;
 static const float ZOOM_STEP = 1.25f;
+static const float VIEWPORT_MARGIN_PX = 20.0f; /* rough allowance for scrollbars/padding */
+
+enum class FitMode { NONE, WIDTH, PAGE };
 
 static hipe_session session;
 static std::unique_ptr<PdfDocument> doc;
 static int current_page = 0;
 static int page_count = 0;
 static hipe_loc img_page;
+static hipe_loc viewport;
 static hipe_loc page_label;
 static hipe_loc zoom_label;
 static float base_render_width = 800.0f;
 static float zoom_level = 1.0f;
 static float render_width = 800.0f;
+static FitMode fit_mode = FitMode::NONE;
 static std::vector<hipe_loc> thumb_locs;
 
 static hipe_loc get_by_id(const char* id) {
@@ -59,8 +67,39 @@ static void update_page_label() {
 
 static void update_zoom_label() {
 	char buf[16];
-	snprintf(buf, sizeof(buf), "%d%%", (int) (zoom_level * 100.0f + 0.5f));
+	if (fit_mode == FitMode::WIDTH) snprintf(buf, sizeof(buf), "Fit W");
+	else if (fit_mode == FitMode::PAGE) snprintf(buf, sizeof(buf), "Fit Pg");
+	else snprintf(buf, sizeof(buf), "%d%%", (int) (zoom_level * 100.0f + 0.5f));
 	hipe_send(session, HIPE_OP_SET_TEXT, 0, zoom_label, 1, buf);
+}
+
+static void apply_fit_mode(int page_number) {
+	/* Recomputes render_width for the active fit mode against the current viewport
+	 * size and (for FitMode::PAGE) the target page's own aspect ratio, since a mixed
+	 * portrait/landscape document needs a different width per page to fit fully. */
+	if (fit_mode == FitMode::NONE) return;
+
+	float viewport_w = 0, viewport_h = 0;
+	get_geometry(viewport, &viewport_w, &viewport_h);
+	if (viewport_w < 50.0f) return; /* not laid out yet; keep the previous width */
+
+	if (fit_mode == FitMode::WIDTH) {
+		render_width = viewport_w - VIEWPORT_MARGIN_PX;
+	} else if (fit_mode == FitMode::PAGE) {
+		float page_w = 0, page_h = 0;
+		try {
+			doc->pageSize(page_number, &page_w, &page_h);
+		} catch (const std::exception& e) {
+			fprintf(stderr, "apply_fit_mode: %s\n", e.what());
+			return;
+		}
+		float aspect_h_over_w = (page_w > 0) ? (page_h / page_w) : 1.0f;
+		float width_for_height_fit = (viewport_h - VIEWPORT_MARGIN_PX) / aspect_h_over_w;
+		render_width = std::min(viewport_w - VIEWPORT_MARGIN_PX, width_for_height_fit);
+	}
+
+	render_width = std::max(render_width, 50.0f);
+	zoom_level = render_width / base_render_width;
 }
 
 static void highlight_thumbnail(int page_number) {
@@ -75,6 +114,7 @@ static void highlight_thumbnail(int page_number) {
 static void render_and_show(int page_number) {
 	if (page_number < 0 || page_number >= page_count) return;
 	current_page = page_number;
+	apply_fit_mode(current_page);
 
 	std::vector<uint8_t> png;
 	try {
@@ -103,10 +143,17 @@ static void render_and_show(int page_number) {
 }
 
 static void set_zoom(float new_zoom) {
+	fit_mode = FitMode::NONE; /* manual zoom overrides any active fit mode */
 	if (new_zoom < ZOOM_MIN) new_zoom = ZOOM_MIN;
 	if (new_zoom > ZOOM_MAX) new_zoom = ZOOM_MAX;
 	zoom_level = new_zoom;
 	render_width = base_render_width * zoom_level;
+	render_and_show(current_page);
+	update_zoom_label();
+}
+
+static void set_fit_mode(FitMode mode) {
+	fit_mode = mode;
 	render_and_show(current_page);
 	update_zoom_label();
 }
@@ -205,7 +252,7 @@ int main(int argc, char** argv) {
 	 * correctly when the image is bigger than the viewport: auto margins collapse to 0
 	 * instead of clipping the overflow unreachably on both sides. */
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, main_area, 2, "div", "viewport");
-	hipe_loc viewport = get_by_id("viewport");
+	viewport = get_by_id("viewport");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, viewport, 2, "flex", "1");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, viewport, 2, "overflow", "auto");
 
@@ -247,10 +294,20 @@ int main(int argc, char** argv) {
 	hipe_loc zoom_in_btn = get_by_id("zoomInBtn");
 	hipe_send(session, HIPE_OP_APPEND_TEXT, 0, zoom_in_btn, 1, "+");
 
+	hipe_send(session, HIPE_OP_APPEND_TAG, 0, navbar, 2, "button", "fitWidthBtn");
+	hipe_loc fit_width_btn = get_by_id("fitWidthBtn");
+	hipe_send(session, HIPE_OP_APPEND_TEXT, 0, fit_width_btn, 1, "Fit W");
+
+	hipe_send(session, HIPE_OP_APPEND_TAG, 0, navbar, 2, "button", "fitPageBtn");
+	hipe_loc fit_page_btn = get_by_id("fitPageBtn");
+	hipe_send(session, HIPE_OP_APPEND_TEXT, 0, fit_page_btn, 1, "Fit Page");
+
 	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_PREV, prev_btn, 1, "click");
 	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_NEXT, next_btn, 1, "click");
 	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_ZOOM_OUT, zoom_out_btn, 1, "click");
 	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_ZOOM_IN, zoom_in_btn, 1, "click");
+	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_FIT_WIDTH, fit_width_btn, 1, "click");
+	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_FIT_PAGE, fit_page_btn, 1, "click");
 
 	/* Size the initial render to roughly fill the main content area. */
 	float main_w = 0, main_h = 0;
@@ -265,10 +322,16 @@ int main(int argc, char** argv) {
 	hipe_instruction_init(&event);
 	do {
 		hipe_next_instruction(session, &event, 1);
+		if (event.opcode != HIPE_OP_EVENT) continue;
+		/* requestor is only meaningful on HIPE_OP_EVENT replies to our own
+		 * EVENT_REQUESTs -- other instruction types can carry unrelated
+		 * requestor values that happen to collide with our REQ_* codes. */
 		if (event.requestor == REQ_PREV) render_and_show(current_page - 1);
 		else if (event.requestor == REQ_NEXT) render_and_show(current_page + 1);
 		else if (event.requestor == REQ_ZOOM_OUT) set_zoom(zoom_level / ZOOM_STEP);
 		else if (event.requestor == REQ_ZOOM_IN) set_zoom(zoom_level * ZOOM_STEP);
+		else if (event.requestor == REQ_FIT_WIDTH) set_fit_mode(FitMode::WIDTH);
+		else if (event.requestor == REQ_FIT_PAGE) set_fit_mode(FitMode::PAGE);
 		else if (event.requestor >= REQ_THUMB_BASE) render_and_show((int) (event.requestor - REQ_THUMB_BASE));
 	} while (event.opcode != HIPE_OP_FRAME_CLOSE);
 

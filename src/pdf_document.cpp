@@ -36,6 +36,22 @@ int PdfDocument::pageCount() const {
 	return count;
 }
 
+void PdfDocument::pageSize(int pageNumber, float* widthPts, float* heightPts) const {
+	fz_page* page = nullptr;
+	fz_var(page);
+
+	fz_try(ctx) {
+		page = fz_load_page(ctx, doc, pageNumber);
+		fz_rect bounds = fz_bound_page(ctx, page);
+		if (widthPts) *widthPts = bounds.x1 - bounds.x0;
+		if (heightPts) *heightPts = bounds.y1 - bounds.y0;
+	} fz_always(ctx) {
+		if (page) fz_drop_page(ctx, page);
+	} fz_catch(ctx) {
+		throw std::runtime_error("pageSize: page " + std::to_string(pageNumber) + ": " + fz_caught_message(ctx));
+	}
+}
+
 std::vector<uint8_t> PdfDocument::renderPagePng(int pageNumber, float targetWidthPx) const {
 	std::vector<uint8_t> result;
 
