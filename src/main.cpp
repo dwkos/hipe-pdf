@@ -41,6 +41,7 @@ static const float ZOOM_MIN = 0.25f;
 static const float ZOOM_MAX = 4.0f;
 static const float ZOOM_STEP = 1.25f;
 static const float VIEWPORT_MARGIN_PX = 20.0f; /* rough allowance for scrollbars/padding */
+static const float SHADOW_MARGIN_PX = 14.0f; /* room for img_page's box-shadow blur below the page */
 
 enum class FitMode { NONE, WIDTH, PAGE };
 
@@ -68,6 +69,7 @@ static float saved_zoom_level = 1.0f;
 static float wheel_prev_scroll_top = -1.0f;
 static bool wheel_stuck = false;
 static std::chrono::steady_clock::time_point wheel_stuck_since;
+static std::chrono::steady_clock::time_point wheel_cooldown_until;
 static std::vector<hipe_loc> thumb_locs;
 
 static hipe_loc get_by_id(const char* id) {
@@ -238,10 +240,14 @@ static void render_and_show(int page_number, bool land_at_bottom = false) {
 	 * size, rather than flex/overflow centering: a page bigger than the viewport needs
 	 * to stay scrollable from the top, which flex align-items:center can't do reliably
 	 * without "safe center" support (unavailable on this WebKit fork). Horizontal
-	 * centering still uses plain auto margins, which degrade correctly on their own. */
+	 * centering still uses plain auto margins, which degrade correctly on their own.
+	 * The fixed SHADOW_MARGIN_PX margin-bottom (see main()) is subtracted from the gap
+	 * before centering, so img_page's box-shadow always has a bit of room below it --
+	 * otherwise it bleeds past #viewport's scrollable content edge and gets clipped
+	 * there (visible right where #navbar starts, since it's #viewport's bottom too). */
 	float margin_top = 10.0f;
-	if (viewport_h > 50.0f && render_height < viewport_h)
-		margin_top = (viewport_h - render_height) / 2.0f;
+	if (viewport_h > 50.0f && render_height + SHADOW_MARGIN_PX < viewport_h)
+		margin_top = (viewport_h - render_height - SHADOW_MARGIN_PX) / 2.0f;
 	char margin_top_buf[16];
 	snprintf(margin_top_buf, sizeof(margin_top_buf), "%dpx", (int) (margin_top + 0.5f));
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_wrapper, 2, "margin-top", margin_top_buf);
@@ -266,6 +272,7 @@ static void render_and_show(int page_number, bool land_at_bottom = false) {
 }
 
 static const auto WHEEL_EDGE_DWELL = std::chrono::milliseconds(400);
+static const auto WHEEL_NO_SCROLL_COOLDOWN = std::chrono::milliseconds(500);
 
 static void handle_wheel_event() {
 	/* This WebKit fork's generic event bridge doesn't expose wheel delta (see
@@ -288,15 +295,29 @@ static void handle_wheel_event() {
 
 	bool at_top = scroll_top <= 1.0f;
 	bool at_bottom = (scroll_top + viewport_h) >= (scroll_height - 1.0f);
-	bool pinned = (wheel_prev_scroll_top >= 0.0f) && (scroll_top == wheel_prev_scroll_top) && (at_top || at_bottom);
+	auto now = std::chrono::steady_clock::now();
 
+	if (at_top && at_bottom) {
+		/* The whole page already fits with nothing to scroll -- there's no "reached the
+		 * edge" moment to pause at, so flip immediately rather than making the user wait
+		 * out a dwell timer that has nothing to do with this case. Direction still can't
+		 * be inferred (no delta info -- see above), so this always advances forward as a
+		 * pragmatic default; a real fix needs hipecore's event bridge to expose
+		 * deltaY for wheel events specifically. A short cooldown still applies so one
+		 * continuous gesture doesn't cascade through many same-sized short pages. */
+		if (now < wheel_cooldown_until) return;
+		wheel_cooldown_until = now + WHEEL_NO_SCROLL_COOLDOWN;
+		render_and_show(current_page + 1);
+		return;
+	}
+
+	bool pinned = (wheel_prev_scroll_top >= 0.0f) && (scroll_top == wheel_prev_scroll_top) && (at_top || at_bottom);
 	if (!pinned) {
 		wheel_stuck = false;
 		wheel_prev_scroll_top = scroll_top;
 		return;
 	}
 
-	auto now = std::chrono::steady_clock::now();
 	if (!wheel_stuck) {
 		/* Just arrived pinned at the edge -- start a dwell timer instead of flipping
 		 * immediately. A fast scroll-to-bottom gesture fires a burst of wheel ticks
@@ -306,16 +327,13 @@ static void handle_wheel_event() {
 		 * burst or sparser) accumulate against this same timer rather than resetting
 		 * it, and a fresh page always starts unpinned, so this also naturally prevents
 		 * cascading through multiple pages from one gesture -- no separate post-flip
-		 * cooldown is needed. */
+		 * cooldown is needed here (unlike the no-scroll case above). */
 		wheel_stuck = true;
 		wheel_stuck_since = now;
 		return;
 	}
 	if (now - wheel_stuck_since < WHEEL_EDGE_DWELL) return; /* still dwelling */
 
-	/* Ambiguous only when the page doesn't scroll at all (at_top && at_bottom both true)
-	 * -- there's no delta info to tell which direction was intended, so this biases
-	 * towards advancing forward, the more common reading direction. */
 	render_and_show(at_bottom ? current_page + 1 : current_page - 1, /*land_at_bottom=*/ !at_bottom);
 }
 
@@ -534,12 +552,17 @@ int main(int argc, char** argv) {
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, viewport, 2, "div", "pageWrapper");
 	page_wrapper = get_by_id("pageWrapper");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_wrapper, 2, "position", "relative");
-	/* margin-top is recomputed per render for vertical centering; left/right stay auto for
-	 * horizontal centering. No margin-bottom, so the centering math
-	 * (viewport_h - render_height) / 2 is exact rather than skewed by a fixed gap. */
+	/* margin-top is recomputed per render for vertical centering (accounting for the
+	 * fixed margin-bottom below -- see render_and_show); left/right stay auto for
+	 * horizontal centering. margin-bottom reserves room for img_page's box-shadow blur,
+	 * which would otherwise bleed past #viewport's scrollable content edge and get
+	 * clipped there once scrolled to the bottom (or once vertically centered with no
+	 * gap to spare). */
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_wrapper, 2, "margin-left", "auto");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_wrapper, 2, "margin-right", "auto");
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_wrapper, 2, "margin-bottom", "0");
+	char shadow_margin_buf[16];
+	snprintf(shadow_margin_buf, sizeof(shadow_margin_buf), "%dpx", (int) SHADOW_MARGIN_PX);
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_wrapper, 2, "margin-bottom", shadow_margin_buf);
 
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, page_wrapper, 2, "img", "page");
 	img_page = get_by_id("page");
