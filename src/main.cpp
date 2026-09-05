@@ -533,9 +533,16 @@ int main(int argc, char** argv) {
 		"margin:0; font-family:sans-serif; -webkit-user-select:none; user-select:none;");
 	/* Shared text-overlay span properties; per-span geometry is set individually in
 	 * update_text_layer(). "style" isn't in the server's SET_ATTRIBUTE whitelist, so this
-	 * (rather than one combined inline style per span) is how the fixed parts are set. */
+	 * (rather than one combined inline style per span) is how the fixed parts are set.
+	 * overflow:visible (not hidden) matters here: font-size is only approximated from
+	 * line height (no client-side text-measurement API to size it exactly), so the
+	 * invisible text can render wider than its box's width, computed from the real PDF
+	 * line bbox. With overflow:hidden that excess got clipped away and was unreachable
+	 * by the mouse entirely; visible lets it render (still invisibly) past the box at
+	 * its natural position, staying selectable there. #textLayer's own overflow:hidden
+	 * still bounds everything to the page itself, just not per span. */
 	hipe_send(session, HIPE_OP_ADD_STYLE_RULE, 0, 0, 2, "#textLayer span",
-		"position:absolute; color:transparent; white-space:nowrap; overflow:hidden; cursor:text; "
+		"position:absolute; color:transparent; white-space:nowrap; overflow:visible; cursor:text; "
 		"-webkit-user-select:text; user-select:text;");
 
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, 0, 2, "div", "root");
