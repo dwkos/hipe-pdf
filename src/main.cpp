@@ -66,7 +66,8 @@ static bool slideshow_active = false;
 static FitMode saved_fit_mode = FitMode::NONE;
 static float saved_zoom_level = 1.0f;
 static float wheel_prev_scroll_top = -1.0f;
-static std::chrono::steady_clock::time_point wheel_cooldown_until;
+static bool wheel_stuck = false;
+static std::chrono::steady_clock::time_point wheel_stuck_since;
 static std::vector<hipe_loc> thumb_locs;
 
 static hipe_loc get_by_id(const char* id) {
@@ -252,6 +253,7 @@ static void render_and_show(int page_number, bool land_at_bottom = false) {
 	update_page_label();
 	highlight_thumbnail(current_page);
 	wheel_prev_scroll_top = -1.0f; /* fresh content; forget any pinned-edge state from the old page */
+	wheel_stuck = false;
 
 	/* The viewport's scroll position is a property of the container, not the image --
 	 * it doesn't reset just because we swapped img_page's src, so without this a page
@@ -263,16 +265,16 @@ static void render_and_show(int page_number, bool land_at_bottom = false) {
 		hipe_send(session, HIPE_OP_SCROLL_TO, 0, viewport, 3, (char*) nullptr, land_at_bottom ? "100" : "0", "%");
 }
 
+static const auto WHEEL_EDGE_DWELL = std::chrono::milliseconds(400);
+
 static void handle_wheel_event() {
 	/* This WebKit fork's generic event bridge doesn't expose wheel delta (see
 	 * requestEvent() in hipecore's qwebelement.cpp -- non-mouse/keyboard events just
 	 * get a "0" detail string), so direction can't be read directly from the event.
 	 * Instead: compare scrollTop across consecutive wheel ticks. If it's unchanged and
 	 * sitting at an edge, this tick had no scrolling effect, meaning the user is pushing
-	 * further past a limit that's already reached -- flip a page. A tick that just
-	 * newly arrives at the edge (scrollTop changed) is normal arrival, not a page-turn
-	 * request. wheel_prev_scroll_top is reset to -1 on every page change so it always
-	 * takes one fresh tick at the new page's edge before another flip can trigger. */
+	 * further past a limit that's already reached. wheel_prev_scroll_top is reset on
+	 * every page change so a fresh page always needs its own newly-pinned tick first. */
 	hipe_send(session, HIPE_OP_GET_SCROLL_GEOMETRY, 0, viewport, 0);
 	hipe_instruction instr;
 	hipe_instruction_init(&instr);
@@ -286,25 +288,35 @@ static void handle_wheel_event() {
 
 	bool at_top = scroll_top <= 1.0f;
 	bool at_bottom = (scroll_top + viewport_h) >= (scroll_height - 1.0f);
+	bool pinned = (wheel_prev_scroll_top >= 0.0f) && (scroll_top == wheel_prev_scroll_top) && (at_top || at_bottom);
+
+	if (!pinned) {
+		wheel_stuck = false;
+		wheel_prev_scroll_top = scroll_top;
+		return;
+	}
 
 	auto now = std::chrono::steady_clock::now();
-	if (now < wheel_cooldown_until) return;
-	/* A single physical scroll gesture (especially a trackpad) fires a burst of many
-	 * "wheel" events in quick succession. Without this, the tick right after a flip
-	 * would immediately see the new page pinned at its own edge too (e.g. scrollTop
-	 * still 0) and cascade into flipping through the whole document in one gesture. */
-
-	if (wheel_prev_scroll_top >= 0.0f && scroll_top == wheel_prev_scroll_top) {
-		/* Ambiguous only when the page doesn't scroll at all (at_top && at_bottom both
-		 * true) -- there's no delta info to tell which direction was intended, so this
-		 * biases towards advancing forward, the more common reading direction. */
-		if (at_bottom || at_top) {
-			wheel_cooldown_until = now + std::chrono::milliseconds(600);
-			render_and_show(at_bottom ? current_page + 1 : current_page - 1, /*land_at_bottom=*/ !at_bottom);
-			return;
-		}
+	if (!wheel_stuck) {
+		/* Just arrived pinned at the edge -- start a dwell timer instead of flipping
+		 * immediately. A fast scroll-to-bottom gesture fires a burst of wheel ticks
+		 * that would otherwise flip the page as its very first bit of feedback, before
+		 * the user has had a chance to see they've hit the edge and stop scrolling.
+		 * Further ticks that arrive still pinned (whether densely packed in the same
+		 * burst or sparser) accumulate against this same timer rather than resetting
+		 * it, and a fresh page always starts unpinned, so this also naturally prevents
+		 * cascading through multiple pages from one gesture -- no separate post-flip
+		 * cooldown is needed. */
+		wheel_stuck = true;
+		wheel_stuck_since = now;
+		return;
 	}
-	wheel_prev_scroll_top = scroll_top;
+	if (now - wheel_stuck_since < WHEEL_EDGE_DWELL) return; /* still dwelling */
+
+	/* Ambiguous only when the page doesn't scroll at all (at_top && at_bottom both true)
+	 * -- there's no delta info to tell which direction was intended, so this biases
+	 * towards advancing forward, the more common reading direction. */
+	render_and_show(at_bottom ? current_page + 1 : current_page - 1, /*land_at_bottom=*/ !at_bottom);
 }
 
 static void handle_arrow_key(bool down) {
