@@ -54,6 +54,7 @@ static int current_page = 0;
 static int page_count = 0;
 static hipe_loc img_page;
 static hipe_loc page_wrapper;
+static hipe_loc page_status;
 static hipe_loc text_layer;
 static hipe_loc viewport;
 static hipe_loc sidebar;
@@ -69,10 +70,10 @@ static FitMode fit_mode = FitMode::NONE;
 static bool slideshow_active = false;
 static FitMode saved_fit_mode = FitMode::NONE;
 static float saved_zoom_level = 1.0f;
-static float wheel_prev_scroll_top = -1.0f;
 static bool wheel_stuck = false;
 static std::chrono::steady_clock::time_point wheel_stuck_since;
 static std::chrono::steady_clock::time_point wheel_cooldown_until;
+static std::chrono::steady_clock::time_point last_render_finished_at;
 static std::vector<hipe_loc> thumb_locs;
 
 static hipe_loc get_by_id(const char* id) {
@@ -118,11 +119,17 @@ static void apply_fit_mode(float aspect_h_over_w, float viewport_w, float viewpo
 	if (fit_mode == FitMode::NONE) return;
 	if (viewport_w < 50.0f) return; /* not laid out yet; keep the previous width */
 
+	/* VIEWPORT_MARGIN_PX is a rough allowance for scrollbars/padding in the normal
+	 * windowed view -- slideshow has neither (sidebar/navbar are hidden, and the page is
+	 * meant to fill the frame edge-to-edge), so reserving it there just leaves an
+	 * unwanted gap around the page instead of a true fullscreen fit. */
+	float margin = slideshow_active ? 0.0f : VIEWPORT_MARGIN_PX;
+
 	if (fit_mode == FitMode::WIDTH) {
-		render_width = viewport_w - VIEWPORT_MARGIN_PX;
+		render_width = viewport_w - margin;
 	} else if (fit_mode == FitMode::PAGE) {
-		float width_for_height_fit = (viewport_h - VIEWPORT_MARGIN_PX) / aspect_h_over_w;
-		render_width = std::min(viewport_w - VIEWPORT_MARGIN_PX, width_for_height_fit);
+		float width_for_height_fit = (viewport_h - margin) / aspect_h_over_w;
+		render_width = std::min(viewport_w - margin, width_for_height_fit);
 	}
 
 	render_width = std::max(render_width, 50.0f);
@@ -245,6 +252,15 @@ static void update_text_layer(int page_number, float scale) {
 	}
 }
 
+static void show_page_status(const char* message) {
+	hipe_send(session, HIPE_OP_SET_TEXT, 0, page_status, 1, message);
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "display", "flex");
+}
+
+static void hide_page_status() {
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "display", "none");
+}
+
 static void render_and_show(int page_number, bool land_at_bottom = false) {
 	if (page_number < 0 || page_number >= page_count) return;
 	bool page_changed = (page_number != current_page);
@@ -263,29 +279,14 @@ static void render_and_show(int page_number, bool land_at_bottom = false) {
 
 	apply_fit_mode(aspect_h_over_w, viewport_w, viewport_h);
 
-	std::vector<uint8_t> png;
-	try {
-		png = doc->renderPagePng(current_page, render_width);
-	} catch (const std::exception& e) {
-		fprintf(stderr, "Failed to render page %d: %s\n", current_page, e.what());
-		return;
-	}
-
-	hipe_instruction instr;
-	hipe_instruction_init(&instr);
-	instr.opcode = HIPE_OP_SET_SRC;
-	instr.location = img_page;
-	instr.arg[0] = reinterpret_cast<char*>(png.data());
-	instr.arg_length[0] = png.size();
-	instr.arg[1] = (char*) "image/png";
-	instr.arg_length[1] = strlen(instr.arg[1]);
-	hipe_send_instruction(session, instr);
-
-	/* page_wrapper is sized to exactly the rendered box -- img_page and text_layer are
-	 * absolutely positioned at 100%/100% inside it (see main()), so page_wrapper's own
+	/* page_wrapper is sized to exactly the rendered box -- img_page/text_layer/page_status
+	 * are absolutely positioned at 100%/100% inside it (see main()), so page_wrapper's own
 	 * width/height must be set explicitly: absolutely-positioned children are out of
 	 * normal flow and don't contribute to a parent's size the way img_page's own
-	 * intrinsic size used to before the text-layer overlay needed this indirection. */
+	 * intrinsic size used to before the text-layer overlay needed this indirection. This
+	 * only depends on the page's known dimensions/fit mode, not on the render below
+	 * actually succeeding, so it's done up front -- the loading placeholder already sits
+	 * in the right box instead of a stale one. */
 	float render_height = render_width * aspect_h_over_w;
 	char size_buf[16];
 	snprintf(size_buf, sizeof(size_buf), "%dpx", (int) (render_width + 0.5f));
@@ -298,16 +299,70 @@ static void render_and_show(int page_number, bool land_at_bottom = false) {
 	 * to stay scrollable from the top, which flex align-items:center can't do reliably
 	 * without "safe center" support (unavailable on this WebKit fork). Horizontal
 	 * centering still uses plain auto margins, which degrade correctly on their own.
-	 * The fixed SHADOW_MARGIN_PX margin-bottom (see main()) is subtracted from the gap
-	 * before centering, so img_page's box-shadow always has a bit of room below it --
-	 * otherwise it bleeds past #viewport's scrollable content edge and gets clipped
-	 * there (visible right where #navbar starts, since it's #viewport's bottom too). */
-	float margin_top = 10.0f;
-	if (viewport_h > 50.0f && render_height + SHADOW_MARGIN_PX < viewport_h)
-		margin_top = (viewport_h - render_height - SHADOW_MARGIN_PX) / 2.0f;
+	 * The fixed SHADOW_MARGIN_PX margin-bottom is subtracted from the gap before
+	 * centering, so img_page's box-shadow always has a bit of room below it -- otherwise
+	 * it bleeds past #viewport's scrollable content edge and gets clipped there (visible
+	 * right where #navbar starts, since it's #viewport's bottom too). Slideshow disables
+	 * the shadow entirely (see enter_slideshow) and wants a true edge-to-edge fit, so
+	 * neither margin is reserved there. */
+	float shadow_margin = slideshow_active ? 0.0f : SHADOW_MARGIN_PX;
+	float margin_top = slideshow_active ? 0.0f : 10.0f;
+	if (viewport_h > 50.0f && render_height + shadow_margin < viewport_h)
+		margin_top = (viewport_h - render_height - shadow_margin) / 2.0f;
 	char margin_top_buf[16];
 	snprintf(margin_top_buf, sizeof(margin_top_buf), "%dpx", (int) (margin_top + 0.5f));
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_wrapper, 2, "margin-top", margin_top_buf);
+	char margin_bottom_buf[16];
+	snprintf(margin_bottom_buf, sizeof(margin_bottom_buf), "%dpx", (int) (shadow_margin + 0.5f));
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_wrapper, 2, "margin-bottom", margin_bottom_buf);
+
+	/* A complex page's render can take several seconds (see PdfDocument::renderPagePng's
+	 * timeout) -- show a placeholder immediately rather than leaving the previous page's
+	 * now-stale image on screen with no feedback while this call blocks. hipe_send()
+	 * writes straight to the socket with no client-side buffering, so this reaches the
+	 * display before the CPU-bound render below starts. Also drop the old page's text
+	 * spans now rather than leaving them selectable underneath the overlay. */
+	hipe_send(session, HIPE_OP_CLEAR, 0, text_layer, 0);
+	char loading_buf[64];
+	snprintf(loading_buf, sizeof(loading_buf), "Loading page %d / %d...", current_page + 1, page_count);
+	show_page_status(loading_buf);
+	update_page_label();
+	highlight_thumbnail(current_page);
+
+	std::vector<uint8_t> png;
+	try {
+		png = doc->renderPagePng(current_page, render_width);
+	} catch (const std::exception& e) {
+		fprintf(stderr, "Failed to render page %d: %s\n", current_page, e.what());
+		char err_buf[128];
+		snprintf(err_buf, sizeof(err_buf),
+			"Page %d could not be rendered\n(ludicrously complex, or timed out)", current_page + 1);
+		show_page_status(err_buf);
+
+		/* current_page really has moved to the failed page (so a repeated Next/Prev keeps
+		 * making forward progress instead of getting stuck) -- keep the label/thumbnail
+		 * highlight/scroll state in sync with that rather than silently leaving them
+		 * pointing at the old page while the status overlay shows a different one. */
+		update_page_label();
+		highlight_thumbnail(current_page);
+		scroll_thumbnail_into_view(current_page);
+		wheel_stuck = false;
+		last_render_finished_at = std::chrono::steady_clock::now();
+		if (page_changed)
+			hipe_send(session, HIPE_OP_SCROLL_TO, 0, viewport, 3, (char*) nullptr, "0", "%");
+		return;
+	}
+	hide_page_status();
+
+	hipe_instruction instr;
+	hipe_instruction_init(&instr);
+	instr.opcode = HIPE_OP_SET_SRC;
+	instr.location = img_page;
+	instr.arg[0] = reinterpret_cast<char*>(png.data());
+	instr.arg_length[0] = png.size();
+	instr.arg[1] = (char*) "image/png";
+	instr.arg_length[1] = strlen(instr.arg[1]);
+	hipe_send_instruction(session, instr);
 
 	update_text_layer(current_page, render_width / (page_w > 0 ? page_w : render_width));
 
@@ -316,8 +371,8 @@ static void render_and_show(int page_number, bool land_at_bottom = false) {
 	update_page_label();
 	highlight_thumbnail(current_page);
 	scroll_thumbnail_into_view(current_page);
-	wheel_prev_scroll_top = -1.0f; /* fresh content; forget any pinned-edge state from the old page */
-	wheel_stuck = false;
+	wheel_stuck = false; /* fresh content; forget any pinned-edge state from the old page */
+	last_render_finished_at = std::chrono::steady_clock::now();
 
 	/* The viewport's scroll position is a property of the container, not the image --
 	 * it doesn't reset just because we swapped img_page's src, so without this a page
@@ -331,15 +386,39 @@ static void render_and_show(int page_number, bool land_at_bottom = false) {
 
 static const auto WHEEL_EDGE_DWELL = std::chrono::milliseconds(250);
 static const auto WHEEL_NO_SCROLL_COOLDOWN = std::chrono::milliseconds(500);
+static const auto WHEEL_RENDER_SETTLE = std::chrono::milliseconds(300);
 
-static void handle_wheel_event() {
-	/* This WebKit fork's generic event bridge doesn't expose wheel delta (see
-	 * requestEvent() in hipecore's qwebelement.cpp -- non-mouse/keyboard events just
-	 * get a "0" detail string), so direction can't be read directly from the event.
-	 * Instead: compare scrollTop across consecutive wheel ticks. If it's unchanged and
-	 * sitting at an edge, this tick had no scrolling effect, meaning the user is pushing
-	 * further past a limit that's already reached. wheel_prev_scroll_top is reset on
-	 * every page change so a fresh page always needs its own newly-pinned tick first. */
+/* wheel event details are "deltaX,deltaY,deltaMode" (see requestEvent() in hipecore's
+ * qwebelement.cpp) -- only the sign of deltaY matters here, regardless of deltaMode
+ * (pixel/line/page), so no unit conversion is needed. */
+static float parse_wheel_delta_y(const char* details) {
+	if (!details) return 0.0f;
+	const char* comma = strchr(details, ',');
+	if (!comma) return 0.0f;
+	return atof(comma + 1);
+}
+
+static void handle_wheel_event(float delta_y) {
+	/* hipecore's event bridge now reports real wheel deltas, so direction comes straight
+	 * from the event instead of being inferred by comparing consecutive scrollTop values
+	 * across ticks. Native scrolling still happens on its own (wheel isn't
+	 * preventDefault'd), so this just watches for the viewport already being at the edge
+	 * in the direction the wheel is pushing, and turns the page there. */
+	if (delta_y == 0.0f) return;
+
+	/* A slow render (see PdfDocument::renderPagePng's timeout) blocks this whole client
+	 * for as long as it takes, during which any further wheel ticks the user sends just
+	 * queue up unprocessed. Once the render returns and the event loop gets back around
+	 * to them, they'd otherwise be evaluated against the page we just landed on -- stale
+	 * leftover momentum from the very gesture that caused this page turn, misread as a
+	 * fresh one and prone to immediately flipping again (especially if the new page has
+	 * no scrollable overflow, where a single tick is enough to turn the page). Ignoring
+	 * wheel ticks for a brief window after any render finishes discards that backlog
+	 * without needing to peek/unread instructions off the wire. */
+	if (std::chrono::steady_clock::now() - last_render_finished_at < WHEEL_RENDER_SETTLE) return;
+
+	bool wants_forward = delta_y > 0;
+
 	hipe_send(session, HIPE_OP_GET_SCROLL_GEOMETRY, 0, viewport, 0);
 	hipe_instruction instr;
 	hipe_instruction_init(&instr);
@@ -356,23 +435,19 @@ static void handle_wheel_event() {
 	auto now = std::chrono::steady_clock::now();
 
 	if (at_top && at_bottom) {
-		/* The whole page already fits with nothing to scroll -- there's no "reached the
-		 * edge" moment to pause at, so flip immediately rather than making the user wait
-		 * out a dwell timer that has nothing to do with this case. Direction still can't
-		 * be inferred (no delta info -- see above), so this always advances forward as a
-		 * pragmatic default; a real fix needs hipecore's event bridge to expose
-		 * deltaY for wheel events specifically. A short cooldown still applies so one
-		 * continuous gesture doesn't cascade through many same-sized short pages. */
+		/* Nothing to scroll at all -- no "reached the edge" moment to pause at, so flip
+		 * immediately (in the real direction) rather than making the user wait out a
+		 * dwell timer that has nothing to do with this case. A short cooldown still
+		 * applies so one continuous gesture doesn't cascade through many short pages. */
 		if (now < wheel_cooldown_until) return;
 		wheel_cooldown_until = now + WHEEL_NO_SCROLL_COOLDOWN;
-		render_and_show(current_page + 1);
+		render_and_show(wants_forward ? current_page + 1 : current_page - 1, /*land_at_bottom=*/ !wants_forward);
 		return;
 	}
 
-	bool pinned = (wheel_prev_scroll_top >= 0.0f) && (scroll_top == wheel_prev_scroll_top) && (at_top || at_bottom);
+	bool pinned = (wants_forward && at_bottom) || (!wants_forward && at_top);
 	if (!pinned) {
 		wheel_stuck = false;
-		wheel_prev_scroll_top = scroll_top;
 		return;
 	}
 
@@ -392,7 +467,7 @@ static void handle_wheel_event() {
 	}
 	if (now - wheel_stuck_since < WHEEL_EDGE_DWELL) return; /* still dwelling */
 
-	render_and_show(at_bottom ? current_page + 1 : current_page - 1, /*land_at_bottom=*/ !at_bottom);
+	render_and_show(wants_forward ? current_page + 1 : current_page - 1, /*land_at_bottom=*/ !wants_forward);
 }
 
 static void handle_arrow_key(bool down) {
@@ -457,6 +532,12 @@ static void enter_slideshow() {
 	 * Copy item for a text selection. So this is only requested while actually in
 	 * slideshow, not unconditionally at startup, so text stays copyable otherwise. */
 	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_SLIDESHOW_MENU, main_area, 1, "contextmenu");
+	/* Same reasoning for "click": requesting it only from here (not unconditionally at
+	 * startup) means the click that just entered slideshow -- which bubbles from the
+	 * Slideshow button up through navbar to main_area -- has already finished bubbling
+	 * before this listener exists, so it doesn't also immediately advance the very page
+	 * we just switched to. */
+	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_SLIDESHOW_ADVANCE, main_area, 1, "click");
 
 	set_fit_mode(FitMode::PAGE); /* triggers render_and_show, which calls update_slideshow_background */
 }
@@ -474,6 +555,7 @@ static void leave_slideshow() {
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, /*body*/ 0, 2, "background-color", "");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, /*body*/ 0, 2, "color", "");
 	hipe_send(session, HIPE_OP_EVENT_CANCEL, 0, main_area, 1, "contextmenu");
+	hipe_send(session, HIPE_OP_EVENT_CANCEL, 0, main_area, 1, "click");
 
 	if (saved_fit_mode == FitMode::NONE) set_zoom(saved_zoom_level);
 	else set_fit_mode(saved_fit_mode);
@@ -637,17 +719,11 @@ int main(int argc, char** argv) {
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, viewport, 2, "div", "pageWrapper");
 	page_wrapper = get_by_id("pageWrapper");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_wrapper, 2, "position", "relative");
-	/* margin-top is recomputed per render for vertical centering (accounting for the
-	 * fixed margin-bottom below -- see render_and_show); left/right stay auto for
-	 * horizontal centering. margin-bottom reserves room for img_page's box-shadow blur,
-	 * which would otherwise bleed past #viewport's scrollable content edge and get
-	 * clipped there once scrolled to the bottom (or once vertically centered with no
-	 * gap to spare). */
+	/* margin-top/margin-bottom are recomputed per render for vertical centering and the
+	 * box-shadow allowance respectively (see render_and_show); left/right stay auto here
+	 * for horizontal centering, which doesn't need per-render recomputation. */
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_wrapper, 2, "margin-left", "auto");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_wrapper, 2, "margin-right", "auto");
-	char shadow_margin_buf[16];
-	snprintf(shadow_margin_buf, sizeof(shadow_margin_buf), "%dpx", (int) SHADOW_MARGIN_PX);
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_wrapper, 2, "margin-bottom", shadow_margin_buf);
 
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, page_wrapper, 2, "img", "page");
 	img_page = get_by_id("page");
@@ -666,6 +742,29 @@ int main(int argc, char** argv) {
 	 * text-measurement API, spans can't be CSS-scaled to match glyph metrics exactly the
 	 * way PDF.js does -- font-size is approximated from line height, so alignment is
 	 * "good enough to select the right text", not pixel-perfect. */
+	/* Overlay shown while a page is (re-)rendering or if that render fails -- covers
+	 * img_page/text_layer (later in DOM order, plus an explicit z-index for safety) so
+	 * the previous page's now-stale content isn't left on screen with no feedback during
+	 * a slow render. Hidden by default; toggled via show_page_status()/hide_page_status(). */
+	hipe_send(session, HIPE_OP_APPEND_TAG, 0, page_wrapper, 2, "div", "pageStatus");
+	page_status = get_by_id("pageStatus");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "position", "absolute");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "top", "0");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "left", "0");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "width", "100%");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "height", "100%");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "z-index", "2");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "display", "none");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "align-items", "center");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "justify-content", "center");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "text-align", "center");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "white-space", "pre-line");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "background", "rgba(255,255,255,0.9)");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "color", "#333");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "font-size", "16px");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "padding", "20px");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "box-sizing", "border-box");
+
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, page_wrapper, 2, "div", "textLayer");
 	text_layer = get_by_id("textLayer");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, text_layer, 2, "position", "absolute");
@@ -846,7 +945,7 @@ int main(int argc, char** argv) {
 				case KEY_ARROWDOWN: handle_arrow_key(true); break;
 			}
 		}
-		else if (event.requestor == REQ_WHEEL) handle_wheel_event();
+		else if (event.requestor == REQ_WHEEL) handle_wheel_event(parse_wheel_delta_y(event.arg[1]));
 		else if (event.requestor == REQ_RESIZE && fit_mode != FitMode::NONE) render_and_show(current_page);
 		else if (event.requestor >= REQ_THUMB_BASE) render_and_show((int) (event.requestor - REQ_THUMB_BASE));
 	} while (event.opcode != HIPE_OP_FRAME_CLOSE);
