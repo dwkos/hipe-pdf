@@ -4,11 +4,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-Scaffold + MVP single-page viewing + thumbnail sidebar + zoom (with Fit Width/Fit Page modes) + slideshow
-mode implemented (see `.claude/plans` history / git log for the phased roadmap), plus keyboard
-navigation (PageUp/PageDown/Home/End/arrows), scroll-wheel page-turning at scroll limits, and an
-invisible selectable-text overlay atop the raster render (Acrobat/PDF.js style — see "Text rendering
-approach" below). Not yet implemented: continuous scroll (the README's other stretch goal).
+Scaffold + MVP single-page viewing + thumbnail sidebar (auto-scrolls to keep the current page's
+thumbnail in view) + zoom (with Fit Width/Fit Page modes) + slideshow mode implemented (see
+`.claude/plans` history / git log for the phased roadmap), plus keyboard navigation
+(PageUp/PageDown/Home/End/arrows), scroll-wheel page-turning at scroll limits, and an invisible
+selectable-text overlay atop the raster render (Acrobat/PDF.js style — see "Text rendering approach"
+below). Not yet implemented: continuous scroll (the README's other stretch goal).
+
+Note: `HIPE_OP_GET_GEOMETRY` reports a scroll-independent position — it does not change as an ancestor
+element is scrolled (confirmed empirically; see `scroll_thumbnail_into_view` in `main.cpp`). Any future
+code computing on-screen/visibility geometry across a scrollable ancestor needs to account for this
+directly (compare against that ancestor's own scroll position, not by adding it to reported coordinates).
 
 ## Text rendering approach
 
