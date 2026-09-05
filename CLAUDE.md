@@ -6,8 +6,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Scaffold + MVP single-page viewing + thumbnail sidebar + zoom (with Fit Width/Fit Page modes) + slideshow
 mode implemented (see `.claude/plans` history / git log for the phased roadmap), plus keyboard
-navigation (PageUp/PageDown/Home/End/arrows) and scroll-wheel page-turning at scroll limits. Not yet
-implemented: SVG rendering, continuous scroll (both stretch goals per the README).
+navigation (PageUp/PageDown/Home/End/arrows), scroll-wheel page-turning at scroll limits, and an
+invisible selectable-text overlay atop the raster render (Acrobat/PDF.js style — see "Text rendering
+approach" below). Not yet implemented: continuous scroll (the README's other stretch goal).
+
+## Text rendering approach
+
+Pages are rendered as raster PNG (`PdfDocument::renderPagePng`, via MuPDF) — not DOM-level SVG. This was
+a deliberate choice after evaluating DOM-SVG construction (building an `<svg>` subtree via Hipe opcodes,
+which a separate hipecore fix was going to enable): raster is simpler (one render path, no dual
+raster/DOM sync) and responsive enough to keep. To still get selectable/copyable text, an invisible text
+layer (`#textLayer` in `main.cpp`, `PdfDocument::pageTextSpans` in `pdf_document.cpp`) is layered on top
+via MuPDF's structured-text extraction (`fz_new_stext_page_from_page_number`) — one absolutely-positioned,
+`color:transparent` `<span>` per line, real text content, positioned/sized from the line's bbox scaled to
+match the raster. Confirmed working end-to-end (drag-select + copy verified via `xsel --primary` showing
+real extracted text). Known limitation: Hipe has no client-side text-measurement API, so spans can't be
+CSS-scaled to their exact glyph run the way PDF.js does — font-size is approximated from line height, so
+alignment is "close enough to select the right text," not pixel-perfect.
 
 ## Build
 

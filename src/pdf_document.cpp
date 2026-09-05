@@ -141,3 +141,43 @@ void PdfDocument::pageBackgroundColor(int pageNumber, uint8_t* r, uint8_t* g, ui
 	if (g) *g = (uint8_t) sumG;
 	if (b) *b = (uint8_t) sumB;
 }
+
+std::vector<PdfDocument::TextSpan> PdfDocument::pageTextSpans(int pageNumber) const {
+	std::vector<TextSpan> spans;
+
+	fz_stext_page* stext = nullptr;
+	fz_var(stext);
+
+	fz_try(ctx) {
+		fz_stext_options opts;
+		fz_init_stext_options(ctx, &opts);
+		stext = fz_new_stext_page_from_page_number(ctx, doc, pageNumber, &opts);
+
+		for (fz_stext_block* block = stext->first_block; block; block = block->next) {
+			if (block->type != FZ_STEXT_BLOCK_TEXT) continue;
+			for (fz_stext_line* line = block->u.t.first_line; line; line = line->next) {
+				std::string text;
+				for (fz_stext_char* ch = line->first_char; ch; ch = ch->next) {
+					char utf8[4];
+					int len = fz_runetochar(utf8, ch->c);
+					text.append(utf8, len);
+				}
+				if (text.empty()) continue;
+
+				TextSpan span;
+				span.text = text;
+				span.x = line->bbox.x0;
+				span.y = line->bbox.y0;
+				span.width = line->bbox.x1 - line->bbox.x0;
+				span.height = line->bbox.y1 - line->bbox.y0;
+				spans.push_back(std::move(span));
+			}
+		}
+	} fz_always(ctx) {
+		if (stext) fz_drop_stext_page(ctx, stext);
+	} fz_catch(ctx) {
+		throw std::runtime_error("pageTextSpans: page " + std::to_string(pageNumber) + ": " + fz_caught_message(ctx));
+	}
+
+	return spans;
+}

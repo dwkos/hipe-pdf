@@ -49,6 +49,8 @@ static std::unique_ptr<PdfDocument> doc;
 static int current_page = 0;
 static int page_count = 0;
 static hipe_loc img_page;
+static hipe_loc page_wrapper;
+static hipe_loc text_layer;
 static hipe_loc viewport;
 static hipe_loc sidebar;
 static hipe_loc navbar;
@@ -145,6 +147,44 @@ static void update_slideshow_background(int page_number) {
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_leave_btn, 2, "color", fg);
 }
 
+static void update_text_layer(int page_number, float scale) {
+	hipe_send(session, HIPE_OP_CLEAR, 0, text_layer, 0);
+
+	std::vector<PdfDocument::TextSpan> spans;
+	try {
+		spans = doc->pageTextSpans(page_number);
+	} catch (const std::exception& e) {
+		fprintf(stderr, "update_text_layer: %s\n", e.what());
+		return;
+	}
+
+	char buf[16];
+	for (const auto& span : spans) {
+		hipe_send(session, HIPE_OP_APPEND_TAG, 0, text_layer, 1, "span");
+		hipe_loc loc = hipe_newest_location();
+		hipe_send(session, HIPE_OP_SET_TEXT, 0, loc, 1, span.text.c_str());
+
+		/* Common properties (position:absolute, color:transparent, etc.) come from the
+		 * "#textLayer span" rule added once at startup; only per-span geometry needs
+		 * setting here. font-size is approximated from line height -- Hipe has no
+		 * client-side text-measurement API to CSS-scale each span to its exact glyph
+		 * run the way PDF.js does, so this is "close enough to select", not
+		 * pixel-perfect. */
+		snprintf(buf, sizeof(buf), "%dpx", (int) (span.x * scale));
+		hipe_send(session, HIPE_OP_SET_STYLE, 0, loc, 2, "left", buf);
+		snprintf(buf, sizeof(buf), "%dpx", (int) (span.y * scale));
+		hipe_send(session, HIPE_OP_SET_STYLE, 0, loc, 2, "top", buf);
+		snprintf(buf, sizeof(buf), "%dpx", (int) (span.width * scale + 1));
+		hipe_send(session, HIPE_OP_SET_STYLE, 0, loc, 2, "width", buf);
+		snprintf(buf, sizeof(buf), "%dpx", (int) (span.height * scale + 1));
+		hipe_send(session, HIPE_OP_SET_STYLE, 0, loc, 2, "height", buf);
+		snprintf(buf, sizeof(buf), "%dpx", (int) (span.height * scale));
+		hipe_send(session, HIPE_OP_SET_STYLE, 0, loc, 2, "line-height", buf);
+		snprintf(buf, sizeof(buf), "%dpx", (int) (span.height * scale * 0.9f));
+		hipe_send(session, HIPE_OP_SET_STYLE, 0, loc, 2, "font-size", buf);
+	}
+}
+
 static void render_and_show(int page_number, bool land_at_bottom = false) {
 	if (page_number < 0 || page_number >= page_count) return;
 	bool page_changed = (page_number != current_page);
@@ -181,22 +221,31 @@ static void render_and_show(int page_number, bool land_at_bottom = false) {
 	instr.arg_length[1] = strlen(instr.arg[1]);
 	hipe_send_instruction(session, instr);
 
-	char width_buf[16];
-	snprintf(width_buf, sizeof(width_buf), "%dpx", (int) (render_width + 0.5f));
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "width", width_buf);
+	/* page_wrapper is sized to exactly the rendered box -- img_page and text_layer are
+	 * absolutely positioned at 100%/100% inside it (see main()), so page_wrapper's own
+	 * width/height must be set explicitly: absolutely-positioned children are out of
+	 * normal flow and don't contribute to a parent's size the way img_page's own
+	 * intrinsic size used to before the text-layer overlay needed this indirection. */
+	float render_height = render_width * aspect_h_over_w;
+	char size_buf[16];
+	snprintf(size_buf, sizeof(size_buf), "%dpx", (int) (render_width + 0.5f));
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_wrapper, 2, "width", size_buf);
+	snprintf(size_buf, sizeof(size_buf), "%dpx", (int) (render_height + 0.5f));
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_wrapper, 2, "height", size_buf);
 
 	/* Center vertically via an explicit margin-top computed from the actual rendered
 	 * size, rather than flex/overflow centering: a page bigger than the viewport needs
 	 * to stay scrollable from the top, which flex align-items:center can't do reliably
 	 * without "safe center" support (unavailable on this WebKit fork). Horizontal
 	 * centering still uses plain auto margins, which degrade correctly on their own. */
-	float render_height = render_width * aspect_h_over_w;
 	float margin_top = 10.0f;
 	if (viewport_h > 50.0f && render_height < viewport_h)
 		margin_top = (viewport_h - render_height) / 2.0f;
 	char margin_top_buf[16];
 	snprintf(margin_top_buf, sizeof(margin_top_buf), "%dpx", (int) (margin_top + 0.5f));
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "margin-top", margin_top_buf);
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_wrapper, 2, "margin-top", margin_top_buf);
+
+	update_text_layer(current_page, render_width / (page_w > 0 ? page_w : render_width));
 
 	if (slideshow_active) update_slideshow_background(current_page);
 
@@ -424,6 +473,11 @@ int main(int argc, char** argv) {
 	 * theme/CSS (HIPE_THEME, --css) supplies, so the app matches the system theme when
 	 * not in slideshow. Slideshow temporarily overrides these (see enter_slideshow). */
 	hipe_send(session, HIPE_OP_ADD_STYLE_RULE, 0, 0, 2, "body", "margin:0; font-family:sans-serif;");
+	/* Shared text-overlay span properties; per-span geometry is set individually in
+	 * update_text_layer(). "style" isn't in the server's SET_ATTRIBUTE whitelist, so this
+	 * (rather than one combined inline style per span) is how the fixed parts are set. */
+	hipe_send(session, HIPE_OP_ADD_STYLE_RULE, 0, 0, 2, "#textLayer span",
+		"position:absolute; color:transparent; white-space:nowrap; overflow:hidden; cursor:text;");
 
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, 0, 2, "div", "root");
 	hipe_loc root = get_by_id("root");
@@ -461,18 +515,45 @@ int main(int argc, char** argv) {
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, viewport, 2, "flex", "1");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, viewport, 2, "overflow", "auto");
 
-	hipe_send(session, HIPE_OP_APPEND_TAG, 0, viewport, 2, "img", "page");
+	/* #pageWrapper is sized to exactly the rendered image's box (see render_and_show) and
+	 * carries the centering margins that used to live on img_page directly; img#page and
+	 * #textLayer both sit inside it at 100%/100%, absolutely positioned, so the invisible
+	 * text spans line up with the raster underneath regardless of centering/zoom. */
+	hipe_send(session, HIPE_OP_APPEND_TAG, 0, viewport, 2, "div", "pageWrapper");
+	page_wrapper = get_by_id("pageWrapper");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_wrapper, 2, "position", "relative");
+	/* margin-top is recomputed per render for vertical centering; left/right stay auto for
+	 * horizontal centering. No margin-bottom, so the centering math
+	 * (viewport_h - render_height) / 2 is exact rather than skewed by a fixed gap. */
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_wrapper, 2, "margin-left", "auto");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_wrapper, 2, "margin-right", "auto");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_wrapper, 2, "margin-bottom", "0");
+
+	hipe_send(session, HIPE_OP_APPEND_TAG, 0, page_wrapper, 2, "img", "page");
 	img_page = get_by_id("page");
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "display", "block");
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "height", "auto");
-	/* margin-top is recomputed per render (see render_and_show) for vertical centering;
-	 * left/right stay auto for horizontal centering. No margin-bottom, so the centering
-	 * math (viewport_h - render_height) / 2 is exact rather than skewed by a fixed gap. */
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "margin-left", "auto");
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "margin-right", "auto");
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "margin-bottom", "0");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "position", "absolute");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "top", "0");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "left", "0");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "width", "100%");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "height", "100%");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "background", "white");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "box-shadow", "0 0 12px rgba(0,0,0,0.5)");
+
+	/* Experimental: an invisible, selectable text overlay in the Acrobat/PDF.js style --
+	 * real text nodes positioned atop the raster image so the underlying content can be
+	 * selected/copied, without needing DOM-level SVG rendering. Built per-render in
+	 * update_text_layer() from PdfDocument::pageTextSpans(). Since Hipe has no client-side
+	 * text-measurement API, spans can't be CSS-scaled to match glyph metrics exactly the
+	 * way PDF.js does -- font-size is approximated from line height, so alignment is
+	 * "good enough to select the right text", not pixel-perfect. */
+	hipe_send(session, HIPE_OP_APPEND_TAG, 0, page_wrapper, 2, "div", "textLayer");
+	text_layer = get_by_id("textLayer");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, text_layer, 2, "position", "absolute");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, text_layer, 2, "top", "0");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, text_layer, 2, "left", "0");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, text_layer, 2, "width", "100%");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, text_layer, 2, "height", "100%");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, text_layer, 2, "overflow", "hidden");
 
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, main_area, 2, "div", "navbar");
 	navbar = get_by_id("navbar");

@@ -36,6 +36,16 @@ public:
 	 * page corners are usually background rather than content. Not real background
 	 * detection. Falls back to white on failure rather than throwing. */
 
+	struct TextSpan {
+		std::string text;
+		float x, y, width, height; /* PDF points, same page space renderPagePng scales from */
+	};
+
+	std::vector<TextSpan> pageTextSpans(int pageNumber) const;
+	/* One span per line of extracted text, for building a selectable text overlay atop
+	 * the raster render (positions/sizes are in PDF points -- the caller scales them by
+	 * the same factor used for the raster width). Throws std::runtime_error on failure. */
+
 private:
 	fz_context* ctx;
 	fz_document* doc;
