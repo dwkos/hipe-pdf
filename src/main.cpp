@@ -162,7 +162,8 @@ static void update_text_layer(int page_number, float scale) {
 	}
 
 	char buf[16];
-	for (const auto& span : spans) {
+	for (size_t i = 0; i < spans.size(); i++) {
+		const auto& span = spans[i];
 		hipe_send(session, HIPE_OP_APPEND_TAG, 0, text_layer, 1, "span");
 		hipe_loc loc = hipe_newest_location();
 		hipe_send(session, HIPE_OP_SET_TEXT, 0, loc, 1, span.text.c_str());
@@ -173,13 +174,28 @@ static void update_text_layer(int page_number, float scale) {
 		 * client-side text-measurement API to CSS-scale each span to its exact glyph
 		 * run the way PDF.js does, so this is "close enough to select", not
 		 * pixel-perfect. */
+
+		/* Stretch the box (not the font-size/line-height, which stay true to the actual
+		 * line) down to the next line's top, so there's no gap between lines for the
+		 * mouse to land in with no span underneath. Dragging a selection through such a
+		 * gap has no text position for WebKit's hit-testing to resolve to there, and it
+		 * can jump to a distant/wrong spot instead of the nearest line. Capped at 1.5x
+		 * the line's own height so this doesn't bridge a real paragraph/column gap into
+		 * unrelated content further down (or, via a same-page column break, back up). */
+		float box_height = span.height;
+		if (i + 1 < spans.size()) {
+			float gap_to_next = spans[i + 1].y - (span.y + span.height);
+			if (gap_to_next > 0 && gap_to_next < span.height * 1.5f)
+				box_height = spans[i + 1].y - span.y;
+		}
+
 		snprintf(buf, sizeof(buf), "%dpx", (int) (span.x * scale));
 		hipe_send(session, HIPE_OP_SET_STYLE, 0, loc, 2, "left", buf);
 		snprintf(buf, sizeof(buf), "%dpx", (int) (span.y * scale));
 		hipe_send(session, HIPE_OP_SET_STYLE, 0, loc, 2, "top", buf);
 		snprintf(buf, sizeof(buf), "%dpx", (int) (span.width * scale + 1));
 		hipe_send(session, HIPE_OP_SET_STYLE, 0, loc, 2, "width", buf);
-		snprintf(buf, sizeof(buf), "%dpx", (int) (span.height * scale + 1));
+		snprintf(buf, sizeof(buf), "%dpx", (int) (box_height * scale + 1));
 		hipe_send(session, HIPE_OP_SET_STYLE, 0, loc, 2, "height", buf);
 		snprintf(buf, sizeof(buf), "%dpx", (int) (span.height * scale));
 		hipe_send(session, HIPE_OP_SET_STYLE, 0, loc, 2, "line-height", buf);
@@ -508,12 +524,17 @@ int main(int argc, char** argv) {
 	/* No background-color/color here deliberately -- leave body on whatever Hipe's own
 	 * theme/CSS (HIPE_THEME, --css) supplies, so the app matches the system theme when
 	 * not in slideshow. Slideshow temporarily overrides these (see enter_slideshow). */
-	hipe_send(session, HIPE_OP_ADD_STYLE_RULE, 0, 0, 2, "body", "margin:0; font-family:sans-serif;");
+	/* user-select:none here (inherited by everything) plus the override back to text
+	 * below is what keeps a stray drag-select or "Select all" confined to the actual
+	 * page text instead of grabbing the whole GUI (buttons, labels, thumbnails, etc). */
+	hipe_send(session, HIPE_OP_ADD_STYLE_RULE, 0, 0, 2, "body",
+		"margin:0; font-family:sans-serif; -webkit-user-select:none; user-select:none;");
 	/* Shared text-overlay span properties; per-span geometry is set individually in
 	 * update_text_layer(). "style" isn't in the server's SET_ATTRIBUTE whitelist, so this
 	 * (rather than one combined inline style per span) is how the fixed parts are set. */
 	hipe_send(session, HIPE_OP_ADD_STYLE_RULE, 0, 0, 2, "#textLayer span",
-		"position:absolute; color:transparent; white-space:nowrap; overflow:hidden; cursor:text;");
+		"position:absolute; color:transparent; white-space:nowrap; overflow:hidden; cursor:text; "
+		"-webkit-user-select:text; user-select:text;");
 
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, 0, 2, "div", "root");
 	hipe_loc root = get_by_id("root");
