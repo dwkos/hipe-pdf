@@ -1,5 +1,6 @@
 #include <hipe.h>
 #include "pdf_document.hpp"
+#include "icon_data.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -560,6 +561,15 @@ int main(int argc, char** argv) {
 
 	session = hipe_open_session(0, 0, 0, argv[0]);
 	if (!session) return 3;
+
+	{
+		hipe_instruction icon_instr;
+		hipe_instruction_init(&icon_instr);
+		icon_instr.opcode = HIPE_OP_SET_ICON;
+		icon_instr.arg[0] = reinterpret_cast<char*>(const_cast<unsigned char*>(kAppIconPng));
+		icon_instr.arg_length[0] = kAppIconPngLen;
+		hipe_send_instruction(session, icon_instr);
+	}
 
 	/* No background-color/color here deliberately -- leave body on whatever Hipe's own
 	 * theme/CSS (HIPE_THEME, --css) supplies, so the app matches the system theme when
