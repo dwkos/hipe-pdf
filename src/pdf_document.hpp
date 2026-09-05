@@ -30,6 +30,12 @@ public:
 	 * targetWidthPx (height follows the page's aspect ratio). Throws std::runtime_error
 	 * on failure. */
 
+	void pageBackgroundColor(int pageNumber, uint8_t* r, uint8_t* g, uint8_t* b) const;
+	/* Cheap heuristic for chrome-matching purposes (e.g. a slideshow surround): renders
+	 * the page very small and averages its four corner pixels, on the assumption that
+	 * page corners are usually background rather than content. Not real background
+	 * detection. Falls back to white on failure rather than throwing. */
+
 private:
 	fz_context* ctx;
 	fz_document* doc;

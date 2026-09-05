@@ -85,27 +85,16 @@ static void update_zoom_label() {
 	hipe_send(session, HIPE_OP_SET_TEXT, 0, zoom_label, 1, buf);
 }
 
-static void apply_fit_mode(int page_number) {
+static void apply_fit_mode(float aspect_h_over_w, float viewport_w, float viewport_h) {
 	/* Recomputes render_width for the active fit mode against the current viewport
 	 * size and (for FitMode::PAGE) the target page's own aspect ratio, since a mixed
 	 * portrait/landscape document needs a different width per page to fit fully. */
 	if (fit_mode == FitMode::NONE) return;
-
-	float viewport_w = 0, viewport_h = 0;
-	get_geometry(viewport, &viewport_w, &viewport_h);
 	if (viewport_w < 50.0f) return; /* not laid out yet; keep the previous width */
 
 	if (fit_mode == FitMode::WIDTH) {
 		render_width = viewport_w - VIEWPORT_MARGIN_PX;
 	} else if (fit_mode == FitMode::PAGE) {
-		float page_w = 0, page_h = 0;
-		try {
-			doc->pageSize(page_number, &page_w, &page_h);
-		} catch (const std::exception& e) {
-			fprintf(stderr, "apply_fit_mode: %s\n", e.what());
-			return;
-		}
-		float aspect_h_over_w = (page_w > 0) ? (page_h / page_w) : 1.0f;
 		float width_for_height_fit = (viewport_h - VIEWPORT_MARGIN_PX) / aspect_h_over_w;
 		render_width = std::min(viewport_w - VIEWPORT_MARGIN_PX, width_for_height_fit);
 	}
@@ -123,10 +112,39 @@ static void highlight_thumbnail(int page_number) {
 	previous = page_number;
 }
 
+static void update_slideshow_background(int page_number) {
+	uint8_t r = 255, g = 255, b = 255;
+	doc->pageBackgroundColor(page_number, &r, &g, &b);
+
+	char color_buf[24];
+	snprintf(color_buf, sizeof(color_buf), "rgb(%d,%d,%d)", r, g, b);
+	/* Standard luminance-based contrast pick, so periscope's own body-colormatched
+	 * chrome (and our own leave button) stay legible against light or dark pages. */
+	double luminance = 0.299 * r + 0.587 * g + 0.114 * b;
+	const char* fg = (luminance > 128.0) ? "black" : "white";
+
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, main_area, 2, "background", color_buf);
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, /*body*/ 0, 2, "background-color", color_buf);
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, /*body*/ 0, 2, "color", fg);
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_leave_btn, 2, "color", fg);
+}
+
 static void render_and_show(int page_number) {
 	if (page_number < 0 || page_number >= page_count) return;
 	current_page = page_number;
-	apply_fit_mode(current_page);
+
+	float page_w = 0, page_h = 0;
+	try {
+		doc->pageSize(current_page, &page_w, &page_h);
+	} catch (const std::exception& e) {
+		fprintf(stderr, "render_and_show: %s\n", e.what());
+	}
+	float aspect_h_over_w = (page_w > 0) ? (page_h / page_w) : 1.0f;
+
+	float viewport_w = 0, viewport_h = 0;
+	get_geometry(viewport, &viewport_w, &viewport_h);
+
+	apply_fit_mode(aspect_h_over_w, viewport_w, viewport_h);
 
 	std::vector<uint8_t> png;
 	try {
@@ -149,6 +167,21 @@ static void render_and_show(int page_number) {
 	char width_buf[16];
 	snprintf(width_buf, sizeof(width_buf), "%dpx", (int) (render_width + 0.5f));
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "width", width_buf);
+
+	/* Center vertically via an explicit margin-top computed from the actual rendered
+	 * size, rather than flex/overflow centering: a page bigger than the viewport needs
+	 * to stay scrollable from the top, which flex align-items:center can't do reliably
+	 * without "safe center" support (unavailable on this WebKit fork). Horizontal
+	 * centering still uses plain auto margins, which degrade correctly on their own. */
+	float render_height = render_width * aspect_h_over_w;
+	float margin_top = 10.0f;
+	if (viewport_h > 50.0f && render_height < viewport_h)
+		margin_top = (viewport_h - render_height) / 2.0f;
+	char margin_top_buf[16];
+	snprintf(margin_top_buf, sizeof(margin_top_buf), "%dpx", (int) (margin_top + 0.5f));
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "margin-top", margin_top_buf);
+
+	if (slideshow_active) update_slideshow_background(current_page);
 
 	update_page_label();
 	highlight_thumbnail(current_page);
@@ -178,8 +211,11 @@ static void enter_slideshow() {
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, sidebar, 2, "display", "none");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "display", "none");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_leave_btn, 2, "display", "block");
+	/* Dropped so the page blends into the color-matched surround instead of standing
+	 * out inside a boxed frame -- update_slideshow_background() takes over from here. */
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "box-shadow", "none");
 
-	set_fit_mode(FitMode::PAGE);
+	set_fit_mode(FitMode::PAGE); /* triggers render_and_show, which calls update_slideshow_background */
 }
 
 static void leave_slideshow() {
@@ -188,6 +224,10 @@ static void leave_slideshow() {
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, sidebar, 2, "display", "block");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "display", "flex");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_leave_btn, 2, "display", "none");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "box-shadow", "0 0 12px rgba(0,0,0,0.5)");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, main_area, 2, "background", "#333333");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, /*body*/ 0, 2, "background-color", "white");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, /*body*/ 0, 2, "color", "black");
 
 	if (saved_fit_mode == FitMode::NONE) set_zoom(saved_zoom_level);
 	else set_fit_mode(saved_fit_mode);
@@ -195,19 +235,19 @@ static void leave_slideshow() {
 
 static void show_slideshow_dialog() {
 	/* arg[3] symbols line up 1:1 with the arg[2] choices, plus one trailing symbol
-	 * for the dialog itself: next=\xe2\x96\xb6, prev=\xe2\x97\x80, start=\xe2\x8f\xae,
+	 * for the dialog itself: prev=\xe2\x97\x80, next=\xe2\x96\xb6, start=\xe2\x8f\xae,
 	 * end=\xe2\x8f\xad, leave=\xe2\x9c\x95, dialog icon=\xe2\x96\xb6 again. */
 	hipe_send(session, HIPE_OP_DIALOG, REQ_SLIDESHOW_DIALOG, 0, 4,
 		"Slideshow", "Choose an action:",
-		"Next page\nPrevious page\nGo to start\nGo to end\nLeave slideshow",
-		"\xe2\x96\xb6\n\xe2\x97\x80\n\xe2\x8f\xae\n\xe2\x8f\xad\n\xe2\x9c\x95\n\xe2\x96\xb6");
+		"Previous page\nNext page\nGo to start\nGo to end\nLeave slideshow",
+		"\xe2\x97\x80\n\xe2\x96\xb6\n\xe2\x8f\xae\n\xe2\x8f\xad\n\xe2\x9c\x95\n\xe2\x96\xb6");
 }
 
 static void handle_slideshow_dialog_return(const hipe_instruction& reply) {
 	int choice = reply.arg[1] ? atoi(reply.arg[1]) : 0;
 	switch (choice) {
-		case 1: render_and_show(current_page + 1); break;
-		case 2: render_and_show(current_page - 1); break;
+		case 1: render_and_show(current_page - 1); break;
+		case 2: render_and_show(current_page + 1); break;
 		case 3: render_and_show(0); break;
 		case 4: render_and_show(page_count - 1); break;
 		case 5: leave_slideshow(); break;
@@ -277,7 +317,8 @@ int main(int argc, char** argv) {
 	session = hipe_open_session(0, 0, 0, argv[0]);
 	if (!session) return 3;
 
-	hipe_send(session, HIPE_OP_ADD_STYLE_RULE, 0, 0, 2, "body", "margin:0; font-family:sans-serif;");
+	hipe_send(session, HIPE_OP_ADD_STYLE_RULE, 0, 0, 2, "body",
+		"margin:0; font-family:sans-serif; background-color:white; color:black;");
 
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, 0, 2, "div", "root");
 	hipe_loc root = get_by_id("root");
@@ -318,7 +359,12 @@ int main(int argc, char** argv) {
 	img_page = get_by_id("page");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "display", "block");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "height", "auto");
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "margin", "10px auto");
+	/* margin-top is recomputed per render (see render_and_show) for vertical centering;
+	 * left/right stay auto for horizontal centering. No margin-bottom, so the centering
+	 * math (viewport_h - render_height) / 2 is exact rather than skewed by a fixed gap. */
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "margin-left", "auto");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "margin-right", "auto");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "margin-bottom", "0");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "background", "white");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "box-shadow", "0 0 12px rgba(0,0,0,0.5)");
 

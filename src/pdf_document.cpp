@@ -94,3 +94,50 @@ std::vector<uint8_t> PdfDocument::renderPagePng(int pageNumber, float targetWidt
 
 	return result;
 }
+
+void PdfDocument::pageBackgroundColor(int pageNumber, uint8_t* r, uint8_t* g, uint8_t* b) const {
+	const float SAMPLE_WIDTH_PX = 32.0f;
+
+	int sumR = 255, sumG = 255, sumB = 255; /* fall back to white */
+
+	fz_page* page = nullptr;
+	fz_pixmap* pix = nullptr;
+	fz_var(page);
+	fz_var(pix);
+
+	fz_try(ctx) {
+		page = fz_load_page(ctx, doc, pageNumber);
+		fz_rect bounds = fz_bound_page(ctx, page);
+		float pageWidth = bounds.x1 - bounds.x0;
+		float scale = (pageWidth > 0) ? (SAMPLE_WIDTH_PX / pageWidth) : 1.0f;
+		pix = fz_new_pixmap_from_page(ctx, page, fz_scale(scale, scale), fz_device_rgb(ctx), 0);
+
+		int w = fz_pixmap_width(ctx, pix);
+		int h = fz_pixmap_height(ctx, pix);
+		int n = fz_pixmap_components(ctx, pix);
+		ptrdiff_t stride = fz_pixmap_stride(ctx, pix);
+		unsigned char* samples = fz_pixmap_samples(ctx, pix);
+
+		if (w > 0 && h > 0 && n >= 3) {
+			int xs[2] = {0, w - 1};
+			int ys[2] = {0, h - 1};
+			sumR = sumG = sumB = 0;
+			for (int yi = 0; yi < 2; yi++) {
+				for (int xi = 0; xi < 2; xi++) {
+					unsigned char* p = samples + ys[yi] * stride + xs[xi] * n;
+					sumR += p[0]; sumG += p[1]; sumB += p[2];
+				}
+			}
+			sumR /= 4; sumG /= 4; sumB /= 4;
+		}
+	} fz_always(ctx) {
+		if (pix) fz_drop_pixmap(ctx, pix);
+		if (page) fz_drop_page(ctx, page);
+	} fz_catch(ctx) {
+		/* keep the white fallback set above */
+	}
+
+	if (r) *r = (uint8_t) sumR;
+	if (g) *g = (uint8_t) sumG;
+	if (b) *b = (uint8_t) sumB;
+}
