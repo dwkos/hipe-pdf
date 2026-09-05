@@ -23,6 +23,7 @@
 #define REQ_SLIDESHOW_DIALOG 11
 #define REQ_KEYDOWN 12
 #define REQ_WHEEL 13
+#define REQ_RESIZE 14
 #define REQ_THUMB_BASE 1000
 
 /* DOM KeyboardEvent.keyCode values (legacy, but what this WebKit fork's
@@ -326,7 +327,7 @@ static void render_and_show(int page_number, bool land_at_bottom = false) {
 		hipe_send(session, HIPE_OP_SCROLL_TO, 0, viewport, 3, (char*) nullptr, land_at_bottom ? "100" : "0", "%");
 }
 
-static const auto WHEEL_EDGE_DWELL = std::chrono::milliseconds(400);
+static const auto WHEEL_EDGE_DWELL = std::chrono::milliseconds(250);
 static const auto WHEEL_NO_SCROLL_COOLDOWN = std::chrono::milliseconds(500);
 
 static void handle_wheel_event() {
@@ -737,6 +738,10 @@ int main(int argc, char** argv) {
 	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_SLIDESHOW_ADVANCE, main_area, 1, "click");
 	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_KEYDOWN, 0, 1, "keydown"); /* location 0 = whole-frame keydown */
 	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_WHEEL, viewport, 1, "wheel");
+	/* "resize" is special-cased server-side to attach to the window regardless of the
+	 * location given (see requestEvent() in hipecore's qwebelement.cpp), so location is
+	 * arbitrary here -- 0 to match the other whole-frame requests above. */
+	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_RESIZE, 0, 1, "resize");
 
 	/* Size the initial render to roughly fill the main content area. */
 	float main_w = 0, main_h = 0;
@@ -787,6 +792,7 @@ int main(int argc, char** argv) {
 			}
 		}
 		else if (event.requestor == REQ_WHEEL) handle_wheel_event();
+		else if (event.requestor == REQ_RESIZE && fit_mode != FitMode::NONE) render_and_show(current_page);
 		else if (event.requestor >= REQ_THUMB_BASE) render_and_show((int) (event.requestor - REQ_THUMB_BASE));
 	} while (event.opcode != HIPE_OP_FRAME_CLOSE);
 
