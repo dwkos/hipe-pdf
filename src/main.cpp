@@ -15,6 +15,11 @@
 #define REQ_ZOOM_IN 4
 #define REQ_FIT_WIDTH 5
 #define REQ_FIT_PAGE 6
+#define REQ_SLIDESHOW_ENTER 7
+#define REQ_SLIDESHOW_LEAVE 8
+#define REQ_SLIDESHOW_ADVANCE 9
+#define REQ_SLIDESHOW_MENU 10
+#define REQ_SLIDESHOW_DIALOG 11
 #define REQ_THUMB_BASE 1000
 
 static const float THUMB_WIDTH_PX = 110.0f;
@@ -31,12 +36,19 @@ static int current_page = 0;
 static int page_count = 0;
 static hipe_loc img_page;
 static hipe_loc viewport;
+static hipe_loc sidebar;
+static hipe_loc navbar;
+static hipe_loc main_area;
+static hipe_loc slideshow_leave_btn;
 static hipe_loc page_label;
 static hipe_loc zoom_label;
 static float base_render_width = 800.0f;
 static float zoom_level = 1.0f;
 static float render_width = 800.0f;
 static FitMode fit_mode = FitMode::NONE;
+static bool slideshow_active = false;
+static FitMode saved_fit_mode = FitMode::NONE;
+static float saved_zoom_level = 1.0f;
 static std::vector<hipe_loc> thumb_locs;
 
 static hipe_loc get_by_id(const char* id) {
@@ -158,6 +170,51 @@ static void set_fit_mode(FitMode mode) {
 	update_zoom_label();
 }
 
+static void enter_slideshow() {
+	slideshow_active = true;
+	saved_fit_mode = fit_mode;
+	saved_zoom_level = zoom_level;
+
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, sidebar, 2, "display", "none");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "display", "none");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_leave_btn, 2, "display", "block");
+
+	set_fit_mode(FitMode::PAGE);
+}
+
+static void leave_slideshow() {
+	slideshow_active = false;
+
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, sidebar, 2, "display", "block");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "display", "flex");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_leave_btn, 2, "display", "none");
+
+	if (saved_fit_mode == FitMode::NONE) set_zoom(saved_zoom_level);
+	else set_fit_mode(saved_fit_mode);
+}
+
+static void show_slideshow_dialog() {
+	/* arg[3] symbols line up 1:1 with the arg[2] choices, plus one trailing symbol
+	 * for the dialog itself: next=\xe2\x96\xb6, prev=\xe2\x97\x80, start=\xe2\x8f\xae,
+	 * end=\xe2\x8f\xad, leave=\xe2\x9c\x95, dialog icon=\xe2\x96\xb6 again. */
+	hipe_send(session, HIPE_OP_DIALOG, REQ_SLIDESHOW_DIALOG, 0, 4,
+		"Slideshow", "Choose an action:",
+		"Next page\nPrevious page\nGo to start\nGo to end\nLeave slideshow",
+		"\xe2\x96\xb6\n\xe2\x97\x80\n\xe2\x8f\xae\n\xe2\x8f\xad\n\xe2\x9c\x95\n\xe2\x96\xb6");
+}
+
+static void handle_slideshow_dialog_return(const hipe_instruction& reply) {
+	int choice = reply.arg[1] ? atoi(reply.arg[1]) : 0;
+	switch (choice) {
+		case 1: render_and_show(current_page + 1); break;
+		case 2: render_and_show(current_page - 1); break;
+		case 3: render_and_show(0); break;
+		case 4: render_and_show(page_count - 1); break;
+		case 5: leave_slideshow(); break;
+		default: break; /* cancelled, or a framing manager without dialog support */
+	}
+}
+
 static void build_thumbnail_sidebar(hipe_loc sidebar) {
 	/* Eagerly rendered up front; fine for typical documents. A lazy,
 	 * scroll-driven variant (matching the continuous-scroll stretch goal)
@@ -230,7 +287,7 @@ int main(int argc, char** argv) {
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, root, 2, "width", "100vw");
 
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, root, 2, "div", "sidebar");
-	hipe_loc sidebar = get_by_id("sidebar");
+	sidebar = get_by_id("sidebar");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, sidebar, 2, "width", "140px");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, sidebar, 2, "overflow-y", "auto");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, sidebar, 2, "background", "#f0f0f0");
@@ -239,12 +296,13 @@ int main(int argc, char** argv) {
 	build_thumbnail_sidebar(sidebar);
 
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, root, 2, "div", "main");
-	hipe_loc main_area = get_by_id("main");
+	main_area = get_by_id("main");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, main_area, 2, "flex", "1");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, main_area, 2, "display", "flex");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, main_area, 2, "flex-direction", "column");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, main_area, 2, "overflow", "hidden");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, main_area, 2, "background", "#333333");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, main_area, 2, "position", "relative");
 
 	/* #viewport scrolls independently of #navbar below it, so a zoomed-in page can be
 	 * panned without the nav controls scrolling out of view. Centering the page image
@@ -265,7 +323,7 @@ int main(int argc, char** argv) {
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "box-shadow", "0 0 12px rgba(0,0,0,0.5)");
 
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, main_area, 2, "div", "navbar");
-	hipe_loc navbar = get_by_id("navbar");
+	navbar = get_by_id("navbar");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "display", "flex");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "gap", "12px");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "align-items", "center");
@@ -302,12 +360,35 @@ int main(int argc, char** argv) {
 	hipe_loc fit_page_btn = get_by_id("fitPageBtn");
 	hipe_send(session, HIPE_OP_APPEND_TEXT, 0, fit_page_btn, 1, "Fit Page");
 
+	hipe_send(session, HIPE_OP_APPEND_TAG, 0, navbar, 2, "button", "slideshowBtn");
+	hipe_loc slideshow_btn = get_by_id("slideshowBtn");
+	hipe_send(session, HIPE_OP_APPEND_TEXT, 0, slideshow_btn, 1, "Slideshow \xe2\x96\xb6");
+
+	/* Overlay button, only shown once slideshow mode hides the sidebar/navbar -- a
+	 * guaranteed way to exit that doesn't depend on right-click dialog support, which
+	 * varies by framing manager (see HIPE_OP_DIALOG notes in CLAUDE.md). */
+	hipe_send(session, HIPE_OP_APPEND_TAG, 0, main_area, 2, "button", "slideshowLeaveBtn");
+	slideshow_leave_btn = get_by_id("slideshowLeaveBtn");
+	hipe_send(session, HIPE_OP_APPEND_TEXT, 0, slideshow_leave_btn, 1, "\xe2\x9c\x95 Leave Slideshow");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_leave_btn, 2, "display", "none");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_leave_btn, 2, "position", "absolute");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_leave_btn, 2, "top", "10px");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_leave_btn, 2, "right", "10px");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_leave_btn, 2, "opacity", "0.6");
+
 	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_PREV, prev_btn, 1, "click");
 	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_NEXT, next_btn, 1, "click");
 	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_ZOOM_OUT, zoom_out_btn, 1, "click");
 	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_ZOOM_IN, zoom_in_btn, 1, "click");
 	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_FIT_WIDTH, fit_width_btn, 1, "click");
 	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_FIT_PAGE, fit_page_btn, 1, "click");
+	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_SLIDESHOW_ENTER, slideshow_btn, 1, "click");
+	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_SLIDESHOW_LEAVE, slideshow_leave_btn, 1, "click");
+	/* Registered once for the whole main area; guarded by slideshow_active in the
+	 * dispatch loop below rather than requested/cancelled on entering/leaving, since
+	 * only one request per (element, event type) pair can be active at a time anyway. */
+	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_SLIDESHOW_ADVANCE, main_area, 1, "click");
+	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_SLIDESHOW_MENU, main_area, 1, "contextmenu");
 
 	/* Size the initial render to roughly fill the main content area. */
 	float main_w = 0, main_h = 0;
@@ -322,6 +403,12 @@ int main(int argc, char** argv) {
 	hipe_instruction_init(&event);
 	do {
 		hipe_next_instruction(session, &event, 1);
+
+		if (event.opcode == HIPE_OP_DIALOG_RETURN) {
+			if (event.requestor == REQ_SLIDESHOW_DIALOG) handle_slideshow_dialog_return(event);
+			continue;
+		}
+
 		if (event.opcode != HIPE_OP_EVENT) continue;
 		/* requestor is only meaningful on HIPE_OP_EVENT replies to our own
 		 * EVENT_REQUESTs -- other instruction types can carry unrelated
@@ -332,6 +419,10 @@ int main(int argc, char** argv) {
 		else if (event.requestor == REQ_ZOOM_IN) set_zoom(zoom_level * ZOOM_STEP);
 		else if (event.requestor == REQ_FIT_WIDTH) set_fit_mode(FitMode::WIDTH);
 		else if (event.requestor == REQ_FIT_PAGE) set_fit_mode(FitMode::PAGE);
+		else if (event.requestor == REQ_SLIDESHOW_ENTER) enter_slideshow();
+		else if (event.requestor == REQ_SLIDESHOW_LEAVE) leave_slideshow();
+		else if (event.requestor == REQ_SLIDESHOW_ADVANCE && slideshow_active) render_and_show(current_page + 1);
+		else if (event.requestor == REQ_SLIDESHOW_MENU && slideshow_active) show_slideshow_dialog();
 		else if (event.requestor >= REQ_THUMB_BASE) render_and_show((int) (event.requestor - REQ_THUMB_BASE));
 	} while (event.opcode != HIPE_OP_FRAME_CLOSE);
 
