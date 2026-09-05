@@ -4,8 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-Scaffold + MVP single-page viewing implemented (see `.claude/plans` history / git log for the phased
-roadmap). Not yet implemented: thumbnail sidebar, zoom, slideshow, SVG rendering, continuous scroll.
+Scaffold + MVP single-page viewing + thumbnail sidebar implemented (see `.claude/plans` history / git
+log for the phased roadmap). Not yet implemented: zoom, slideshow, SVG rendering, continuous scroll.
 
 ## Build
 
