@@ -25,6 +25,7 @@
 #define REQ_KEYDOWN 12
 #define REQ_WHEEL 13
 #define REQ_RESIZE 14
+#define REQ_ZOOM_RESET 15
 #define REQ_THUMB_BASE 1000
 
 /* DOM KeyboardEvent.keyCode values (legacy, but what this WebKit fork's
@@ -677,49 +678,91 @@ int main(int argc, char** argv) {
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, main_area, 2, "div", "navbar");
 	navbar = get_by_id("navbar");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "display", "flex");
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "gap", "12px");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "align-items", "center");
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "margin", "10px");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "margin", "6px 10px");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "padding", "4px 8px");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "border-radius", "6px");
 	/* Fixed toolbar colors, independent of the theme color showing through #viewport
 	 * behind the page -- otherwise light text can vanish against a light theme. */
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "background", "rgba(0,0,0,0.65)");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "color", "white");
+	/* Icon-first buttons (prev/next/fit) are only one or two glyphs wide -- a fixed
+	 * min-width keeps them from shrinking to an uncomfortably small click target,
+	 * and a larger font-size keeps the symbols themselves legible. Spacing between
+	 * buttons/labels is done with explicit margin-right below rather than the flex
+	 * "gap" property -- this WebKit fork only implements the older CSS
+	 * multi-column "column-gap", not the flex/grid "gap" shorthand, so "gap"
+	 * silently does nothing here (confirmed by checking RenderFlexibleBox.cpp in
+	 * hipecore -- no gap handling at all). */
+	hipe_send(session, HIPE_OP_ADD_STYLE_RULE, 0, 0, 2, "#navbar button",
+		"min-width:32px; padding:4px 8px; font-size:16px; cursor:pointer;");
 
-	hipe_send(session, HIPE_OP_APPEND_TAG, 0, navbar, 2, "button", "prevBtn");
+	const char* GROUP_MARGIN = "22px";  /* between page nav / zoom / slideshow */
+	const char* ITEM_MARGIN = "6px";    /* between controls within one group */
+
+	hipe_send(session, HIPE_OP_APPEND_TAG, 0, navbar, 2, "div", "pageGroup");
+	hipe_loc page_group = get_by_id("pageGroup");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_group, 2, "display", "flex");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_group, 2, "align-items", "center");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_group, 2, "margin-right", GROUP_MARGIN);
+
+	hipe_send(session, HIPE_OP_APPEND_TAG, 0, page_group, 2, "button", "prevBtn");
 	hipe_loc prev_btn = get_by_id("prevBtn");
-	hipe_send(session, HIPE_OP_APPEND_TEXT, 0, prev_btn, 1, "\xe2\x80\xb9 Prev");
+	hipe_send(session, HIPE_OP_APPEND_TEXT, 0, prev_btn, 1, "\xe2\x97\x80" /* ◀ */);
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, prev_btn, 2, "margin-right", ITEM_MARGIN);
 
-	hipe_send(session, HIPE_OP_APPEND_TAG, 0, navbar, 2, "span", "pageLabel");
+	hipe_send(session, HIPE_OP_APPEND_TAG, 0, page_group, 2, "span", "pageLabel");
 	page_label = get_by_id("pageLabel");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_label, 2, "margin-right", ITEM_MARGIN);
 
-	hipe_send(session, HIPE_OP_APPEND_TAG, 0, navbar, 2, "button", "nextBtn");
+	hipe_send(session, HIPE_OP_APPEND_TAG, 0, page_group, 2, "button", "nextBtn");
 	hipe_loc next_btn = get_by_id("nextBtn");
-	hipe_send(session, HIPE_OP_APPEND_TEXT, 0, next_btn, 1, "Next \xe2\x80\xba");
+	hipe_send(session, HIPE_OP_APPEND_TEXT, 0, next_btn, 1, "\xe2\x96\xb6" /* ▶ */);
 
-	hipe_send(session, HIPE_OP_APPEND_TAG, 0, navbar, 2, "button", "zoomOutBtn");
+	hipe_send(session, HIPE_OP_APPEND_TAG, 0, navbar, 2, "div", "zoomGroup");
+	hipe_loc zoom_group = get_by_id("zoomGroup");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, zoom_group, 2, "display", "flex");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, zoom_group, 2, "align-items", "center");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, zoom_group, 2, "margin-right", GROUP_MARGIN);
+
+	hipe_send(session, HIPE_OP_APPEND_TAG, 0, zoom_group, 2, "button", "zoomOutBtn");
 	hipe_loc zoom_out_btn = get_by_id("zoomOutBtn");
-	hipe_send(session, HIPE_OP_APPEND_TEXT, 0, zoom_out_btn, 1, "\xe2\x88\x92");
+	hipe_send(session, HIPE_OP_APPEND_TEXT, 0, zoom_out_btn, 1, "\xf0\x9f\x94\x8d\xe2\x88\x92" /* 🔍− */);
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, zoom_out_btn, 2, "margin-right", ITEM_MARGIN);
 
-	hipe_send(session, HIPE_OP_APPEND_TAG, 0, navbar, 2, "span", "zoomLabel");
+	hipe_send(session, HIPE_OP_APPEND_TAG, 0, zoom_group, 2, "span", "zoomLabel");
 	zoom_label = get_by_id("zoomLabel");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, zoom_label, 2, "margin-right", ITEM_MARGIN);
+	/* Clicking the label itself resets to 100% zoom -- cursor:pointer as the only
+	 * affordance for this (no tooltip support to spell it out otherwise). */
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, zoom_label, 2, "cursor", "pointer");
 
-	hipe_send(session, HIPE_OP_APPEND_TAG, 0, navbar, 2, "button", "zoomInBtn");
+	hipe_send(session, HIPE_OP_APPEND_TAG, 0, zoom_group, 2, "button", "zoomInBtn");
 	hipe_loc zoom_in_btn = get_by_id("zoomInBtn");
-	hipe_send(session, HIPE_OP_APPEND_TEXT, 0, zoom_in_btn, 1, "+");
+	hipe_send(session, HIPE_OP_APPEND_TEXT, 0, zoom_in_btn, 1, "\xf0\x9f\x94\x8d+" /* 🔍+ */);
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, zoom_in_btn, 2, "margin-right", ITEM_MARGIN);
 
-	hipe_send(session, HIPE_OP_APPEND_TAG, 0, navbar, 2, "button", "fitWidthBtn");
+	hipe_send(session, HIPE_OP_APPEND_TAG, 0, zoom_group, 2, "button", "fitWidthBtn");
 	hipe_loc fit_width_btn = get_by_id("fitWidthBtn");
-	hipe_send(session, HIPE_OP_APPEND_TEXT, 0, fit_width_btn, 1, "Fit W");
+	hipe_send(session, HIPE_OP_APPEND_TEXT, 0, fit_width_btn, 1, "\xf0\x9f\x94\x8d\xe2\x86\x94" /* 🔍↔ fit width */);
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, fit_width_btn, 2, "margin-right", ITEM_MARGIN);
 
-	hipe_send(session, HIPE_OP_APPEND_TAG, 0, navbar, 2, "button", "fitPageBtn");
+	hipe_send(session, HIPE_OP_APPEND_TAG, 0, zoom_group, 2, "button", "fitPageBtn");
 	hipe_loc fit_page_btn = get_by_id("fitPageBtn");
-	hipe_send(session, HIPE_OP_APPEND_TEXT, 0, fit_page_btn, 1, "Fit Page");
+	hipe_send(session, HIPE_OP_APPEND_TEXT, 0, fit_page_btn, 1, "\xf0\x9f\x94\x8d\xf0\x9f\x93\x84" /* 🔍📄 fit page -- avoids ⛶, too easily read as periscope's own fullscreen icon */);
 
-	hipe_send(session, HIPE_OP_APPEND_TAG, 0, navbar, 2, "button", "slideshowBtn");
+	hipe_send(session, HIPE_OP_APPEND_TAG, 0, navbar, 2, "div", "slideshowGroup");
+	hipe_loc slideshow_group = get_by_id("slideshowGroup");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_group, 2, "display", "flex");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_group, 2, "align-items", "center");
+
+	hipe_send(session, HIPE_OP_APPEND_TAG, 0, slideshow_group, 2, "button", "slideshowBtn");
 	hipe_loc slideshow_btn = get_by_id("slideshowBtn");
-	hipe_send(session, HIPE_OP_APPEND_TEXT, 0, slideshow_btn, 1, "Slideshow \xe2\x96\xb6");
+	/* Kept as a word rather than an icon-only button -- it's a whole-mode switch,
+	 * not a frequent nav action, and reusing "▶" here would clash with Next above.
+	 * The desktop-computer glyph in front is just a visual cue, not a replacement
+	 * for the label. */
+	hipe_send(session, HIPE_OP_APPEND_TEXT, 0, slideshow_btn, 1, "\xf0\x9f\x92\xbb Slideshow" /* 💻 Slideshow */);
 
 	/* Overlay button, only shown once slideshow mode hides the sidebar/navbar -- a
 	 * guaranteed way to exit that doesn't depend on right-click dialog support, which
@@ -737,15 +780,16 @@ int main(int argc, char** argv) {
 	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_NEXT, next_btn, 1, "click");
 	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_ZOOM_OUT, zoom_out_btn, 1, "click");
 	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_ZOOM_IN, zoom_in_btn, 1, "click");
+	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_ZOOM_RESET, zoom_label, 1, "click");
 	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_FIT_WIDTH, fit_width_btn, 1, "click");
 	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_FIT_PAGE, fit_page_btn, 1, "click");
 	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_SLIDESHOW_ENTER, slideshow_btn, 1, "click");
 	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_SLIDESHOW_LEAVE, slideshow_leave_btn, 1, "click");
-	/* Registered once for the whole main area; guarded by slideshow_active in the
-	 * dispatch loop below rather than requested/cancelled on entering/leaving, since
-	 * only one request per (element, event type) pair can be active at a time anyway.
-	 * "contextmenu" is the exception -- see enter_slideshow/leave_slideshow. */
-	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_SLIDESHOW_ADVANCE, main_area, 1, "click");
+	/* REQ_SLIDESHOW_ADVANCE's "click" on main_area is requested/cancelled in
+	 * enter_slideshow()/leave_slideshow() instead of unconditionally here -- see the
+	 * comment there (matches "contextmenu"'s existing pattern, and for the same reason:
+	 * registering it early would let the click that enters slideshow bubble up from the
+	 * Slideshow button to main_area and immediately advance a page too). */
 	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_KEYDOWN, 0, 1, "keydown"); /* location 0 = whole-frame keydown */
 	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_WHEEL, viewport, 1, "wheel");
 	/* "resize" is special-cased server-side to attach to the window regardless of the
@@ -785,6 +829,7 @@ int main(int argc, char** argv) {
 		else if (event.requestor == REQ_NEXT) render_and_show(current_page + 1);
 		else if (event.requestor == REQ_ZOOM_OUT) set_zoom(zoom_level / ZOOM_STEP);
 		else if (event.requestor == REQ_ZOOM_IN) set_zoom(zoom_level * ZOOM_STEP);
+		else if (event.requestor == REQ_ZOOM_RESET) set_zoom(1.0f);
 		else if (event.requestor == REQ_FIT_WIDTH) set_fit_mode(FitMode::WIDTH);
 		else if (event.requestor == REQ_FIT_PAGE) set_fit_mode(FitMode::PAGE);
 		else if (event.requestor == REQ_SLIDESHOW_ENTER) enter_slideshow();
