@@ -10,9 +10,14 @@
 
 #define REQ_PREV 1
 #define REQ_NEXT 2
+#define REQ_ZOOM_OUT 3
+#define REQ_ZOOM_IN 4
 #define REQ_THUMB_BASE 1000
 
 static const float THUMB_WIDTH_PX = 110.0f;
+static const float ZOOM_MIN = 0.25f;
+static const float ZOOM_MAX = 4.0f;
+static const float ZOOM_STEP = 1.25f;
 
 static hipe_session session;
 static std::unique_ptr<PdfDocument> doc;
@@ -20,6 +25,9 @@ static int current_page = 0;
 static int page_count = 0;
 static hipe_loc img_page;
 static hipe_loc page_label;
+static hipe_loc zoom_label;
+static float base_render_width = 800.0f;
+static float zoom_level = 1.0f;
 static float render_width = 800.0f;
 static std::vector<hipe_loc> thumb_locs;
 
@@ -47,6 +55,12 @@ static void update_page_label() {
 	char buf[64];
 	snprintf(buf, sizeof(buf), "Page %d / %d", current_page + 1, page_count);
 	hipe_send(session, HIPE_OP_SET_TEXT, 0, page_label, 1, buf);
+}
+
+static void update_zoom_label() {
+	char buf[16];
+	snprintf(buf, sizeof(buf), "%d%%", (int) (zoom_level * 100.0f + 0.5f));
+	hipe_send(session, HIPE_OP_SET_TEXT, 0, zoom_label, 1, buf);
 }
 
 static void highlight_thumbnail(int page_number) {
@@ -80,8 +94,21 @@ static void render_and_show(int page_number) {
 	instr.arg_length[1] = strlen(instr.arg[1]);
 	hipe_send_instruction(session, instr);
 
+	char width_buf[16];
+	snprintf(width_buf, sizeof(width_buf), "%dpx", (int) (render_width + 0.5f));
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "width", width_buf);
+
 	update_page_label();
 	highlight_thumbnail(current_page);
+}
+
+static void set_zoom(float new_zoom) {
+	if (new_zoom < ZOOM_MIN) new_zoom = ZOOM_MIN;
+	if (new_zoom > ZOOM_MAX) new_zoom = ZOOM_MAX;
+	zoom_level = new_zoom;
+	render_width = base_render_width * zoom_level;
+	render_and_show(current_page);
+	update_zoom_label();
 }
 
 static void build_thumbnail_sidebar(hipe_loc sidebar) {
@@ -169,15 +196,24 @@ int main(int argc, char** argv) {
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, main_area, 2, "flex", "1");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, main_area, 2, "display", "flex");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, main_area, 2, "flex-direction", "column");
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, main_area, 2, "align-items", "center");
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, main_area, 2, "justify-content", "center");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, main_area, 2, "overflow", "hidden");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, main_area, 2, "background", "#333333");
 
-	hipe_send(session, HIPE_OP_APPEND_TAG, 0, main_area, 2, "img", "page");
+	/* #viewport scrolls independently of #navbar below it, so a zoomed-in page can be
+	 * panned without the nav controls scrolling out of view. Centering the page image
+	 * via auto margins (rather than flex align/justify-center) means the CSS degrades
+	 * correctly when the image is bigger than the viewport: auto margins collapse to 0
+	 * instead of clipping the overflow unreachably on both sides. */
+	hipe_send(session, HIPE_OP_APPEND_TAG, 0, main_area, 2, "div", "viewport");
+	hipe_loc viewport = get_by_id("viewport");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, viewport, 2, "flex", "1");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, viewport, 2, "overflow", "auto");
+
+	hipe_send(session, HIPE_OP_APPEND_TAG, 0, viewport, 2, "img", "page");
 	img_page = get_by_id("page");
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "max-width", "95%");
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "max-height", "85%");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "display", "block");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "height", "auto");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "margin", "10px auto");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "background", "white");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "box-shadow", "0 0 12px rgba(0,0,0,0.5)");
 
@@ -200,15 +236,30 @@ int main(int argc, char** argv) {
 	hipe_loc next_btn = get_by_id("nextBtn");
 	hipe_send(session, HIPE_OP_APPEND_TEXT, 0, next_btn, 1, "Next \xe2\x80\xba");
 
+	hipe_send(session, HIPE_OP_APPEND_TAG, 0, navbar, 2, "button", "zoomOutBtn");
+	hipe_loc zoom_out_btn = get_by_id("zoomOutBtn");
+	hipe_send(session, HIPE_OP_APPEND_TEXT, 0, zoom_out_btn, 1, "\xe2\x88\x92");
+
+	hipe_send(session, HIPE_OP_APPEND_TAG, 0, navbar, 2, "span", "zoomLabel");
+	zoom_label = get_by_id("zoomLabel");
+
+	hipe_send(session, HIPE_OP_APPEND_TAG, 0, navbar, 2, "button", "zoomInBtn");
+	hipe_loc zoom_in_btn = get_by_id("zoomInBtn");
+	hipe_send(session, HIPE_OP_APPEND_TEXT, 0, zoom_in_btn, 1, "+");
+
 	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_PREV, prev_btn, 1, "click");
 	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_NEXT, next_btn, 1, "click");
+	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_ZOOM_OUT, zoom_out_btn, 1, "click");
+	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_ZOOM_IN, zoom_in_btn, 1, "click");
 
 	/* Size the initial render to roughly fill the main content area. */
 	float main_w = 0, main_h = 0;
 	get_geometry(main_area, &main_w, &main_h);
-	if (main_w > 100) render_width = main_w * 0.9f;
+	if (main_w > 100) base_render_width = main_w * 0.9f;
+	render_width = base_render_width * zoom_level;
 
 	render_and_show(0);
+	update_zoom_label();
 
 	hipe_instruction event;
 	hipe_instruction_init(&event);
@@ -216,6 +267,8 @@ int main(int argc, char** argv) {
 		hipe_next_instruction(session, &event, 1);
 		if (event.requestor == REQ_PREV) render_and_show(current_page - 1);
 		else if (event.requestor == REQ_NEXT) render_and_show(current_page + 1);
+		else if (event.requestor == REQ_ZOOM_OUT) set_zoom(zoom_level / ZOOM_STEP);
+		else if (event.requestor == REQ_ZOOM_IN) set_zoom(zoom_level * ZOOM_STEP);
 		else if (event.requestor >= REQ_THUMB_BASE) render_and_show((int) (event.requestor - REQ_THUMB_BASE));
 	} while (event.opcode != HIPE_OP_FRAME_CLOSE);
 
