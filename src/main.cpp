@@ -77,6 +77,7 @@ static float render_width = 800.0f;
 static FitMode fit_mode = FitMode::NONE;
 static bool slideshow_active = false;
 static bool sidebar_visible = true;
+static bool is_busy = false; /* true while a render_and_show call is blocked inside renderPagePng */
 static FitMode saved_fit_mode = FitMode::NONE;
 static float saved_zoom_level = 1.0f;
 /* Tracks whether img_page currently holds a raster that's valid to preview for
@@ -289,6 +290,7 @@ static void hide_page_status() {
 static void render_and_show(int page_number, bool land_at_bottom = false) {
 	if (page_number < 0 || page_number >= page_count) return;
 	bool page_changed = (page_number != current_page);
+	int previous_page = current_page; /* for a less-jarring loading-placeholder color below */
 	current_page = page_number;
 	if (page_changed) current_page_has_raster = false; /* whatever img_page shows now is for a different page */
 
@@ -362,6 +364,22 @@ static void render_and_show(int page_number, bool land_at_bottom = false) {
 		/* Drop the old page's text spans now rather than leaving them selectable
 		 * underneath the overlay. */
 		hipe_send(session, HIPE_OP_CLEAR, 0, text_layer, 0);
+
+		/* Colored to match the page just being left (previous_page -- on the very first
+		 * ever render this is current_page itself, which works out fine too: sampling
+		 * the incoming page's own likely background beats a generic theme color even
+		 * then) rather than the theme-inherited color used elsewhere in #pageStatus --
+		 * a plain blank page in roughly the right tone reads as much less jarring mid-
+		 * navigation than a flash of theme chrome. Same luminance-based contrast pick as
+		 * update_slideshow_background so the message text stays legible either way. */
+		uint8_t bg_r = 255, bg_g = 255, bg_b = 255;
+		doc->pageBackgroundColor(previous_page, &bg_r, &bg_g, &bg_b);
+		char bg_buf[24];
+		snprintf(bg_buf, sizeof(bg_buf), "rgb(%d,%d,%d)", bg_r, bg_g, bg_b);
+		hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "background-color", bg_buf);
+		double luminance = 0.299 * bg_r + 0.587 * bg_g + 0.114 * bg_b;
+		hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "color", luminance > 128.0 ? "black" : "white");
+
 		char loading_buf[64];
 		snprintf(loading_buf, sizeof(loading_buf), "Loading page %d / %d...", current_page + 1, page_count);
 		show_page_status(loading_buf);
@@ -369,14 +387,23 @@ static void render_and_show(int page_number, bool land_at_bottom = false) {
 		highlight_thumbnail(current_page);
 	}
 
+	is_busy = true;
+	hipe_send(session, HIPE_OP_SET_CURSOR, 0, 0, 1, "\xe2\x9a\x99" /* ⚙ */);
 	std::vector<uint8_t> png;
 	try {
 		png = doc->renderPagePng(current_page, render_width);
 	} catch (const std::exception& e) {
+		is_busy = false;
+		hipe_send(session, HIPE_OP_SET_CURSOR, 0, 0, 1, "");
 		fprintf(stderr, "Failed to render page %d: %s\n", current_page, e.what());
 		char err_buf[128];
 		snprintf(err_buf, sizeof(err_buf),
 			"Page %d could not be rendered\n(ludicrously complex, or timed out)", current_page + 1);
+		/* Back to the theme-inherited look (see main()) for the error state specifically --
+		 * unlike the loading placeholder, an error is deliberately distinct chrome rather
+		 * than something that should blend in with the page content. */
+		hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "background-color", "inherit");
+		hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "color", "inherit");
 		show_page_status(err_buf);
 
 		/* current_page really has moved to the failed page (so a repeated Next/Prev keeps
@@ -392,6 +419,8 @@ static void render_and_show(int page_number, bool land_at_bottom = false) {
 			hipe_send(session, HIPE_OP_SCROLL_TO, 0, viewport, 3, (char*) nullptr, "0", "%");
 		return;
 	}
+	is_busy = false;
+	hipe_send(session, HIPE_OP_SET_CURSOR, 0, 0, 1, "");
 	hide_page_status();
 
 	hipe_instruction instr;
