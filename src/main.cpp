@@ -82,11 +82,13 @@ static hipe_loc get_by_id(const char* id) {
 	return loc;
 }
 
-static void get_geometry(hipe_loc target, float* out_w, float* out_h) {
+static void get_geometry(hipe_loc target, float* out_w, float* out_h, float* out_x = nullptr, float* out_y = nullptr) {
 	hipe_send(session, HIPE_OP_GET_GEOMETRY, 0, target, 0);
 	hipe_instruction instr;
 	hipe_instruction_init(&instr);
 	hipe_await_instruction(session, &instr, HIPE_OP_GEOMETRY_RETURN);
+	if (out_x) *out_x = atof(instr.arg[0]);
+	if (out_y) *out_y = atof(instr.arg[1]);
 	if (out_w) *out_w = atof(instr.arg[2]);
 	if (out_h) *out_h = atof(instr.arg[3]);
 	hipe_instruction_clear(&instr);
@@ -131,6 +133,40 @@ static void highlight_thumbnail(int page_number) {
 	if (page_number >= 0 && page_number < (int) thumb_locs.size())
 		hipe_send(session, HIPE_OP_SET_STYLE, 0, thumb_locs[page_number], 2, "border", "2px solid #3388ff");
 	previous = page_number;
+}
+
+static void scroll_thumbnail_into_view(int page_number) {
+	if (page_number < 0 || page_number >= (int) thumb_locs.size()) return;
+	hipe_loc thumb = thumb_locs[page_number];
+	if (!thumb) return;
+
+	float sidebar_h = 0, sidebar_y = 0;
+	get_geometry(sidebar, nullptr, &sidebar_h, nullptr, &sidebar_y);
+	float thumb_h = 0, thumb_y = 0;
+	get_geometry(thumb, nullptr, &thumb_h, nullptr, &thumb_y);
+
+	hipe_send(session, HIPE_OP_GET_SCROLL_GEOMETRY, 0, sidebar, 0);
+	hipe_instruction instr;
+	hipe_instruction_init(&instr);
+	hipe_await_instruction(session, &instr, HIPE_OP_GEOMETRY_RETURN);
+	float scroll_top = atof(instr.arg[1]);
+	hipe_instruction_clear(&instr);
+
+	/* GET_GEOMETRY reports a scroll-independent position (confirmed empirically: it
+	 * doesn't change as the sidebar is scrolled), so thumb_y/sidebar_y already give the
+	 * thumbnail's offset within the sidebar's scrollable content directly -- no need to
+	 * (and it'd be wrong to) add the current scroll_top on top of that. */
+	float thumb_offset = thumb_y - sidebar_y;
+
+	float new_scroll_top;
+	if (thumb_offset < scroll_top) new_scroll_top = thumb_offset; /* scrolled above the view */
+	else if (thumb_offset + thumb_h > scroll_top + sidebar_h) new_scroll_top = thumb_offset + thumb_h - sidebar_h; /* below */
+	else return; /* already fully visible */
+
+	if (new_scroll_top < 0) new_scroll_top = 0;
+	char buf[16];
+	snprintf(buf, sizeof(buf), "%d", (int) new_scroll_top);
+	hipe_send(session, HIPE_OP_SCROLL_TO, 0, sidebar, 2, (char*) nullptr, buf);
 }
 
 static void update_slideshow_background(int page_number) {
@@ -276,6 +312,7 @@ static void render_and_show(int page_number, bool land_at_bottom = false) {
 
 	update_page_label();
 	highlight_thumbnail(current_page);
+	scroll_thumbnail_into_view(current_page);
 	wheel_prev_scroll_top = -1.0f; /* fresh content; forget any pinned-edge state from the old page */
 	wheel_stuck = false;
 
