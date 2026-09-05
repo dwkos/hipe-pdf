@@ -394,6 +394,11 @@ static void enter_slideshow() {
 	/* Dropped so the page blends into the color-matched surround instead of standing
 	 * out inside a boxed frame -- update_slideshow_background() takes over from here. */
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "box-shadow", "none");
+	/* Requesting "contextmenu" always forces preventDefault on the server side (not
+	 * something our request controls), suppressing the native menu -- including its
+	 * Copy item for a text selection. So this is only requested while actually in
+	 * slideshow, not unconditionally at startup, so text stays copyable otherwise. */
+	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_SLIDESHOW_MENU, main_area, 1, "contextmenu");
 
 	set_fit_mode(FitMode::PAGE); /* triggers render_and_show, which calls update_slideshow_background */
 }
@@ -410,6 +415,7 @@ static void leave_slideshow() {
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, main_area, 2, "background", "");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, /*body*/ 0, 2, "background-color", "");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, /*body*/ 0, 2, "color", "");
+	hipe_send(session, HIPE_OP_EVENT_CANCEL, 0, main_area, 1, "contextmenu");
 
 	if (saved_fit_mode == FitMode::NONE) set_zoom(saved_zoom_level);
 	else set_fit_mode(saved_fit_mode);
@@ -659,9 +665,9 @@ int main(int argc, char** argv) {
 	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_SLIDESHOW_LEAVE, slideshow_leave_btn, 1, "click");
 	/* Registered once for the whole main area; guarded by slideshow_active in the
 	 * dispatch loop below rather than requested/cancelled on entering/leaving, since
-	 * only one request per (element, event type) pair can be active at a time anyway. */
+	 * only one request per (element, event type) pair can be active at a time anyway.
+	 * "contextmenu" is the exception -- see enter_slideshow/leave_slideshow. */
 	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_SLIDESHOW_ADVANCE, main_area, 1, "click");
-	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_SLIDESHOW_MENU, main_area, 1, "contextmenu");
 	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_KEYDOWN, 0, 1, "keydown"); /* location 0 = whole-frame keydown */
 	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_WHEEL, viewport, 1, "wheel");
 
