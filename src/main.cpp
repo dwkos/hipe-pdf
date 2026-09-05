@@ -77,6 +77,17 @@ static FitMode fit_mode = FitMode::NONE;
 static bool slideshow_active = false;
 static FitMode saved_fit_mode = FitMode::NONE;
 static float saved_zoom_level = 1.0f;
+/* Tracks whether img_page currently holds a raster that's valid to preview for
+ * current_page -- i.e. whether render_and_show can skip the loading placeholder and
+ * just let the existing raster stretch to the new page_wrapper box (its 100%/100%
+ * sizing already does this for free) while a properly-sized replacement renders,
+ * versus needing to show the placeholder because there's nothing sensible to show yet.
+ * Conceptually three states collapse to this one bool: no raster at all yet (startup),
+ * a raster for a DIFFERENT page (just navigated, stale and not preview-worthy), and a
+ * raster for THIS page (safe to stretch-preview, e.g. a zoom/fit change) -- the first
+ * two both mean false. Set false whenever the page actually changes (see
+ * render_and_show), true right after a successful render, left untouched on failure. */
+static bool current_page_has_raster = false;
 static bool wheel_stuck = false;
 static std::chrono::steady_clock::time_point wheel_stuck_since;
 static std::chrono::steady_clock::time_point wheel_cooldown_until;
@@ -277,6 +288,7 @@ static void render_and_show(int page_number, bool land_at_bottom = false) {
 	if (page_number < 0 || page_number >= page_count) return;
 	bool page_changed = (page_number != current_page);
 	current_page = page_number;
+	if (page_changed) current_page_has_raster = false; /* whatever img_page shows now is for a different page */
 
 	float page_w = 0, page_h = 0;
 	try {
@@ -334,17 +346,26 @@ static void render_and_show(int page_number, bool land_at_bottom = false) {
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, bottom_spacer, 2, "height", spacer_h_buf);
 
 	/* A complex page's render can take several seconds (see PdfDocument::renderPagePng's
-	 * timeout) -- show a placeholder immediately rather than leaving the previous page's
-	 * now-stale image on screen with no feedback while this call blocks. hipe_send()
-	 * writes straight to the socket with no client-side buffering, so this reaches the
-	 * display before the CPU-bound render below starts. Also drop the old page's text
-	 * spans now rather than leaving them selectable underneath the overlay. */
-	hipe_send(session, HIPE_OP_CLEAR, 0, text_layer, 0);
-	char loading_buf[64];
-	snprintf(loading_buf, sizeof(loading_buf), "Loading page %d / %d...", current_page + 1, page_count);
-	show_page_status(loading_buf);
-	update_page_label();
-	highlight_thumbnail(current_page);
+	 * timeout) -- normally that means showing a placeholder immediately rather than
+	 * leaving the previous page's now-stale image on screen with no feedback while this
+	 * call blocks. But if img_page already holds a raster for THIS SAME page (a zoom/fit
+	 * change re-rendering the page we're already on, not a navigation to a new one), that
+	 * raster is still perfectly good to look at -- it's already stretching to fill
+	 * page_wrapper's just-updated box via its own 100%/100% sizing above, so it works as
+	 * an instant preview of roughly the new size with zero extra code, instead of
+	 * replacing it with a blank loading screen. hipe_send() writes straight to the
+	 * socket with no client-side buffering, so when the placeholder IS needed, it
+	 * reaches the display before the CPU-bound render below starts. */
+	if (!current_page_has_raster) {
+		/* Drop the old page's text spans now rather than leaving them selectable
+		 * underneath the overlay. */
+		hipe_send(session, HIPE_OP_CLEAR, 0, text_layer, 0);
+		char loading_buf[64];
+		snprintf(loading_buf, sizeof(loading_buf), "Loading page %d / %d...", current_page + 1, page_count);
+		show_page_status(loading_buf);
+		update_page_label();
+		highlight_thumbnail(current_page);
+	}
 
 	std::vector<uint8_t> png;
 	try {
@@ -380,6 +401,7 @@ static void render_and_show(int page_number, bool land_at_bottom = false) {
 	instr.arg[1] = (char*) "image/png";
 	instr.arg_length[1] = strlen(instr.arg[1]);
 	hipe_send_instruction(session, instr);
+	current_page_has_raster = true;
 
 	update_text_layer(current_page, render_width / (page_w > 0 ? page_w : render_width));
 
@@ -891,6 +913,10 @@ int main(int argc, char** argv) {
 	 * than #pageStatus's 2 to make sure it wins. */
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "z-index", "10");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "padding", "4px 8px");
+	/* Slight transparency now that it's an opaque theme-matched panel rather than the
+	 * old rgba background -- opacity (not another background alpha) so it uniformly
+	 * fades the whole toolbar, buttons/text included, rather than just the fill. */
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "opacity", "0.92");
 	/* Matches body's theme color (see root in main()) instead of a hardcoded black, so it
 	 * reads as one piece of chrome with sidebar and with periscope's own body-colormatched
 	 * frame. A downward drop shadow (meeting sidebar's rightward one at their shared
