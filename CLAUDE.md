@@ -5,8 +5,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project status
 
 Scaffold + MVP single-page viewing + thumbnail sidebar + zoom (with Fit Width/Fit Page modes) + slideshow
-mode implemented (see `.claude/plans` history / git log for the phased roadmap). Not yet implemented:
-SVG rendering, continuous scroll (both stretch goals per the README).
+mode implemented (see `.claude/plans` history / git log for the phased roadmap), plus keyboard
+navigation (PageUp/PageDown/Home/End/arrows) and scroll-wheel page-turning at scroll limits. Not yet
+implemented: SVG rendering, continuous scroll (both stretch goals per the README).
 
 ## Build
 

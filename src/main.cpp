@@ -2,6 +2,7 @@
 #include "pdf_document.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -20,8 +21,21 @@
 #define REQ_SLIDESHOW_ADVANCE 9
 #define REQ_SLIDESHOW_MENU 10
 #define REQ_SLIDESHOW_DIALOG 11
+#define REQ_KEYDOWN 12
+#define REQ_WHEEL 13
 #define REQ_THUMB_BASE 1000
 
+/* DOM KeyboardEvent.keyCode values (legacy, but what this WebKit fork's
+ * keydown detail string actually carries -- see requestEvent() in
+ * hipecore's qwebelement.cpp). */
+#define KEY_PAGEUP 33
+#define KEY_PAGEDOWN 34
+#define KEY_END 35
+#define KEY_HOME 36
+#define KEY_ARROWUP 38
+#define KEY_ARROWDOWN 40
+
+static const float ARROW_SCROLL_STEP_PX = 60.0f;
 static const float THUMB_WIDTH_PX = 110.0f;
 static const float ZOOM_MIN = 0.25f;
 static const float ZOOM_MAX = 4.0f;
@@ -49,6 +63,8 @@ static FitMode fit_mode = FitMode::NONE;
 static bool slideshow_active = false;
 static FitMode saved_fit_mode = FitMode::NONE;
 static float saved_zoom_level = 1.0f;
+static float wheel_prev_scroll_top = -1.0f;
+static std::chrono::steady_clock::time_point wheel_cooldown_until;
 static std::vector<hipe_loc> thumb_locs;
 
 static hipe_loc get_by_id(const char* id) {
@@ -129,8 +145,9 @@ static void update_slideshow_background(int page_number) {
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_leave_btn, 2, "color", fg);
 }
 
-static void render_and_show(int page_number) {
+static void render_and_show(int page_number, bool land_at_bottom = false) {
 	if (page_number < 0 || page_number >= page_count) return;
+	bool page_changed = (page_number != current_page);
 	current_page = page_number;
 
 	float page_w = 0, page_h = 0;
@@ -185,6 +202,90 @@ static void render_and_show(int page_number) {
 
 	update_page_label();
 	highlight_thumbnail(current_page);
+	wheel_prev_scroll_top = -1.0f; /* fresh content; forget any pinned-edge state from the old page */
+
+	/* The viewport's scroll position is a property of the container, not the image --
+	 * it doesn't reset just because we swapped img_page's src, so without this a page
+	 * change leaves the new page scrolled to wherever the old one happened to be. A
+	 * page-changing navigation lands at the top (or bottom, for backward navigation,
+	 * matching a continuous-reading feel); re-rendering the *same* page for a zoom/fit
+	 * change must NOT touch scroll position, so this is skipped when page didn't change. */
+	if (page_changed)
+		hipe_send(session, HIPE_OP_SCROLL_TO, 0, viewport, 3, (char*) nullptr, land_at_bottom ? "100" : "0", "%");
+}
+
+static void handle_wheel_event() {
+	/* This WebKit fork's generic event bridge doesn't expose wheel delta (see
+	 * requestEvent() in hipecore's qwebelement.cpp -- non-mouse/keyboard events just
+	 * get a "0" detail string), so direction can't be read directly from the event.
+	 * Instead: compare scrollTop across consecutive wheel ticks. If it's unchanged and
+	 * sitting at an edge, this tick had no scrolling effect, meaning the user is pushing
+	 * further past a limit that's already reached -- flip a page. A tick that just
+	 * newly arrives at the edge (scrollTop changed) is normal arrival, not a page-turn
+	 * request. wheel_prev_scroll_top is reset to -1 on every page change so it always
+	 * takes one fresh tick at the new page's edge before another flip can trigger. */
+	hipe_send(session, HIPE_OP_GET_SCROLL_GEOMETRY, 0, viewport, 0);
+	hipe_instruction instr;
+	hipe_instruction_init(&instr);
+	hipe_await_instruction(session, &instr, HIPE_OP_GEOMETRY_RETURN);
+	float scroll_top = atof(instr.arg[1]);
+	float scroll_height = atof(instr.arg[3]);
+	hipe_instruction_clear(&instr);
+
+	float viewport_h = 0;
+	get_geometry(viewport, nullptr, &viewport_h);
+
+	bool at_top = scroll_top <= 1.0f;
+	bool at_bottom = (scroll_top + viewport_h) >= (scroll_height - 1.0f);
+
+	auto now = std::chrono::steady_clock::now();
+	if (now < wheel_cooldown_until) return;
+	/* A single physical scroll gesture (especially a trackpad) fires a burst of many
+	 * "wheel" events in quick succession. Without this, the tick right after a flip
+	 * would immediately see the new page pinned at its own edge too (e.g. scrollTop
+	 * still 0) and cascade into flipping through the whole document in one gesture. */
+
+	if (wheel_prev_scroll_top >= 0.0f && scroll_top == wheel_prev_scroll_top) {
+		/* Ambiguous only when the page doesn't scroll at all (at_top && at_bottom both
+		 * true) -- there's no delta info to tell which direction was intended, so this
+		 * biases towards advancing forward, the more common reading direction. */
+		if (at_bottom || at_top) {
+			wheel_cooldown_until = now + std::chrono::milliseconds(600);
+			render_and_show(at_bottom ? current_page + 1 : current_page - 1, /*land_at_bottom=*/ !at_bottom);
+			return;
+		}
+	}
+	wheel_prev_scroll_top = scroll_top;
+}
+
+static void handle_arrow_key(bool down) {
+	/* Arrow keys scroll the viewport a step at a time; once already at the edge in
+	 * the pressed direction, they turn the page instead. Unlike the wheel, each
+	 * keydown (including OS key-repeat while held) is a discrete, intentional
+	 * request, so no burst/cooldown guard is needed here. */
+	hipe_send(session, HIPE_OP_GET_SCROLL_GEOMETRY, 0, viewport, 0);
+	hipe_instruction instr;
+	hipe_instruction_init(&instr);
+	hipe_await_instruction(session, &instr, HIPE_OP_GEOMETRY_RETURN);
+	float scroll_top = atof(instr.arg[1]);
+	float scroll_height = atof(instr.arg[3]);
+	hipe_instruction_clear(&instr);
+
+	float viewport_h = 0;
+	get_geometry(viewport, nullptr, &viewport_h);
+
+	bool at_top = scroll_top <= 1.0f;
+	bool at_bottom = (scroll_top + viewport_h) >= (scroll_height - 1.0f);
+
+	if (down) {
+		if (at_bottom) { render_and_show(current_page + 1); return; }
+	} else {
+		if (at_top) { render_and_show(current_page - 1, true); return; }
+	}
+
+	char step_buf[8];
+	snprintf(step_buf, sizeof(step_buf), "%d", down ? (int) ARROW_SCROLL_STEP_PX : -(int) ARROW_SCROLL_STEP_PX);
+	hipe_send(session, HIPE_OP_SCROLL_BY, 0, viewport, 2, (char*) nullptr, step_buf);
 }
 
 static void set_zoom(float new_zoom) {
@@ -225,9 +326,11 @@ static void leave_slideshow() {
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "display", "flex");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_leave_btn, 2, "display", "none");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "box-shadow", "0 0 12px rgba(0,0,0,0.5)");
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, main_area, 2, "background", "#333333");
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, /*body*/ 0, 2, "background-color", "white");
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, /*body*/ 0, 2, "color", "black");
+	/* Clear back to Hipe's theme default rather than a hardcoded color (empty value
+	 * removes the inline override -- see HIPE_OP_SET_STYLE notes in CLAUDE.md). */
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, main_area, 2, "background", "");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, /*body*/ 0, 2, "background-color", "");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, /*body*/ 0, 2, "color", "");
 
 	if (saved_fit_mode == FitMode::NONE) set_zoom(saved_zoom_level);
 	else set_fit_mode(saved_fit_mode);
@@ -246,7 +349,7 @@ static void show_slideshow_dialog() {
 static void handle_slideshow_dialog_return(const hipe_instruction& reply) {
 	int choice = reply.arg[1] ? atoi(reply.arg[1]) : 0;
 	switch (choice) {
-		case 1: render_and_show(current_page - 1); break;
+		case 1: render_and_show(current_page - 1, true); break;
 		case 2: render_and_show(current_page + 1); break;
 		case 3: render_and_show(0); break;
 		case 4: render_and_show(page_count - 1); break;
@@ -317,8 +420,10 @@ int main(int argc, char** argv) {
 	session = hipe_open_session(0, 0, 0, argv[0]);
 	if (!session) return 3;
 
-	hipe_send(session, HIPE_OP_ADD_STYLE_RULE, 0, 0, 2, "body",
-		"margin:0; font-family:sans-serif; background-color:white; color:black;");
+	/* No background-color/color here deliberately -- leave body on whatever Hipe's own
+	 * theme/CSS (HIPE_THEME, --css) supplies, so the app matches the system theme when
+	 * not in slideshow. Slideshow temporarily overrides these (see enter_slideshow). */
+	hipe_send(session, HIPE_OP_ADD_STYLE_RULE, 0, 0, 2, "body", "margin:0; font-family:sans-serif;");
 
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, 0, 2, "div", "root");
 	hipe_loc root = get_by_id("root");
@@ -342,8 +447,9 @@ int main(int argc, char** argv) {
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, main_area, 2, "display", "flex");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, main_area, 2, "flex-direction", "column");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, main_area, 2, "overflow", "hidden");
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, main_area, 2, "background", "#333333");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, main_area, 2, "position", "relative");
+	/* No background here either -- left transparent so body's theme-supplied color
+	 * shows through behind the page when zoomed out; slideshow overrides it directly. */
 
 	/* #viewport scrolls independently of #navbar below it, so a zoomed-in page can be
 	 * panned without the nav controls scrolling out of view. Centering the page image
@@ -373,7 +479,12 @@ int main(int argc, char** argv) {
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "display", "flex");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "gap", "12px");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "align-items", "center");
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "margin-top", "10px");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "margin", "10px");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "padding", "4px 8px");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "border-radius", "6px");
+	/* Fixed toolbar colors, independent of the theme color showing through #viewport
+	 * behind the page -- otherwise light text can vanish against a light theme. */
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "background", "rgba(0,0,0,0.65)");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "color", "white");
 
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, navbar, 2, "button", "prevBtn");
@@ -435,6 +546,8 @@ int main(int argc, char** argv) {
 	 * only one request per (element, event type) pair can be active at a time anyway. */
 	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_SLIDESHOW_ADVANCE, main_area, 1, "click");
 	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_SLIDESHOW_MENU, main_area, 1, "contextmenu");
+	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_KEYDOWN, 0, 1, "keydown"); /* location 0 = whole-frame keydown */
+	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_WHEEL, viewport, 1, "wheel");
 
 	/* Size the initial render to roughly fill the main content area. */
 	float main_w = 0, main_h = 0;
@@ -459,7 +572,7 @@ int main(int argc, char** argv) {
 		/* requestor is only meaningful on HIPE_OP_EVENT replies to our own
 		 * EVENT_REQUESTs -- other instruction types can carry unrelated
 		 * requestor values that happen to collide with our REQ_* codes. */
-		if (event.requestor == REQ_PREV) render_and_show(current_page - 1);
+		if (event.requestor == REQ_PREV) render_and_show(current_page - 1, true);
 		else if (event.requestor == REQ_NEXT) render_and_show(current_page + 1);
 		else if (event.requestor == REQ_ZOOM_OUT) set_zoom(zoom_level / ZOOM_STEP);
 		else if (event.requestor == REQ_ZOOM_IN) set_zoom(zoom_level * ZOOM_STEP);
@@ -469,6 +582,17 @@ int main(int argc, char** argv) {
 		else if (event.requestor == REQ_SLIDESHOW_LEAVE) leave_slideshow();
 		else if (event.requestor == REQ_SLIDESHOW_ADVANCE && slideshow_active) render_and_show(current_page + 1);
 		else if (event.requestor == REQ_SLIDESHOW_MENU && slideshow_active) show_slideshow_dialog();
+		else if (event.requestor == REQ_KEYDOWN) {
+			switch (event.arg[1] ? atoi(event.arg[1]) : 0) {
+				case KEY_PAGEUP: render_and_show(current_page - 1, true); break;
+				case KEY_PAGEDOWN: render_and_show(current_page + 1); break;
+				case KEY_HOME: render_and_show(0); break;
+				case KEY_END: render_and_show(page_count - 1); break;
+				case KEY_ARROWUP: handle_arrow_key(false); break;
+				case KEY_ARROWDOWN: handle_arrow_key(true); break;
+			}
+		}
+		else if (event.requestor == REQ_WHEEL) handle_wheel_event();
 		else if (event.requestor >= REQ_THUMB_BASE) render_and_show((int) (event.requestor - REQ_THUMB_BASE));
 	} while (event.opcode != HIPE_OP_FRAME_CLOSE);
 
