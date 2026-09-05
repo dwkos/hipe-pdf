@@ -179,13 +179,15 @@ static void update_text_layer(int page_number, float scale) {
 		 * line) down to the next line's top, so there's no gap between lines for the
 		 * mouse to land in with no span underneath. Dragging a selection through such a
 		 * gap has no text position for WebKit's hit-testing to resolve to there, and it
-		 * can jump to a distant/wrong spot instead of the nearest line. Capped at 1.5x
-		 * the line's own height so this doesn't bridge a real paragraph/column gap into
-		 * unrelated content further down (or, via a same-page column break, back up). */
+		 * can jump to a distant/wrong spot instead of the nearest line. The cap is
+		 * generous (4x the line's own height) specifically so this also bridges a normal
+		 * paragraph-break gap (blank line), not just same-paragraph line spacing, while
+		 * still guarding against bridging into unrelated content across a real
+		 * column/section break further down (or, via a same-page column break, back up). */
 		float box_height = span.height;
 		if (i + 1 < spans.size()) {
 			float gap_to_next = spans[i + 1].y - (span.y + span.height);
-			if (gap_to_next > 0 && gap_to_next < span.height * 1.5f)
+			if (gap_to_next > 0 && gap_to_next < span.height * 4.0f)
 				box_height = spans[i + 1].y - span.y;
 		}
 
