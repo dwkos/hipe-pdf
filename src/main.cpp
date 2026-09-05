@@ -26,6 +26,7 @@
 #define REQ_WHEEL 13
 #define REQ_RESIZE 14
 #define REQ_ZOOM_RESET 15
+#define REQ_SIDEBAR_TOGGLE 16
 #define REQ_THUMB_BASE 1000
 
 /* DOM KeyboardEvent.keyCode values (legacy, but what this WebKit fork's
@@ -75,6 +76,7 @@ static float zoom_level = 1.0f;
 static float render_width = 800.0f;
 static FitMode fit_mode = FitMode::NONE;
 static bool slideshow_active = false;
+static bool sidebar_visible = true;
 static FitMode saved_fit_mode = FitMode::NONE;
 static float saved_zoom_level = 1.0f;
 /* Tracks whether img_page currently holds a raster that's valid to preview for
@@ -555,6 +557,21 @@ static void set_fit_mode(FitMode mode) {
 	update_zoom_label();
 }
 
+static void toggle_sidebar() {
+	sidebar_visible = !sidebar_visible;
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, sidebar, 2, "display", sidebar_visible ? "block" : "none");
+	/* navbar is position:fixed with "left" hardcoded to clear the sidebar (see main()) --
+	 * that offset needs to collapse back to 0 when the sidebar's hidden, or the toolbar
+	 * would sit indented over empty space for no reason. */
+	if (sidebar_visible) {
+		char buf[16];
+		snprintf(buf, sizeof(buf), "%dpx", (int) SIDEBAR_WIDTH_PX);
+		hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "left", buf);
+	} else {
+		hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "left", "0");
+	}
+}
+
 static void enter_slideshow() {
 	slideshow_active = true;
 	saved_fit_mode = fit_mode;
@@ -584,7 +601,10 @@ static void enter_slideshow() {
 static void leave_slideshow() {
 	slideshow_active = false;
 
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, sidebar, 2, "display", "block");
+	/* Respects sidebar_visible rather than forcing it back on -- a user who'd toggled the
+	 * sidebar off before entering slideshow shouldn't have that choice silently undone by
+	 * leaving it again. */
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, sidebar, 2, "display", sidebar_visible ? "block" : "none");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "display", "flex");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_leave_btn, 2, "display", "none");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "box-shadow", "3px 3px 6px rgba(0,0,0,0.55), -6px -6px 5px rgba(255,255,255,0.2)");
@@ -942,6 +962,15 @@ int main(int argc, char** argv) {
 	const char* GROUP_MARGIN = "22px";  /* between page nav / zoom / slideshow */
 	const char* ITEM_MARGIN = "6px";    /* between controls within one group */
 
+	/* Leftmost, ahead of the page-nav group -- now that sidebar and navbar read as one
+	 * L-shaped panel (see #viewport/#navbar above), a sidebar show/hide toggle belongs
+	 * with the rest of the chrome that panel represents rather than tucked away
+	 * elsewhere. */
+	hipe_send(session, HIPE_OP_APPEND_TAG, 0, navbar, 2, "button", "sidebarToggleBtn");
+	hipe_loc sidebar_toggle_btn = get_by_id("sidebarToggleBtn");
+	hipe_send(session, HIPE_OP_APPEND_TEXT, 0, sidebar_toggle_btn, 1, "\xe2\x98\xb0" /* ☰ */);
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, sidebar_toggle_btn, 2, "margin-right", GROUP_MARGIN);
+
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, navbar, 2, "div", "pageGroup");
 	hipe_loc page_group = get_by_id("pageGroup");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_group, 2, "display", "flex");
@@ -1029,6 +1058,7 @@ int main(int argc, char** argv) {
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_leave_btn, 2, "right", "10px");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_leave_btn, 2, "opacity", "0.6");
 
+	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_SIDEBAR_TOGGLE, sidebar_toggle_btn, 1, "click");
 	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_PREV, prev_btn, 1, "click");
 	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_NEXT, next_btn, 1, "click");
 	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_ZOOM_OUT, zoom_out_btn, 1, "click");
@@ -1078,7 +1108,8 @@ int main(int argc, char** argv) {
 		/* requestor is only meaningful on HIPE_OP_EVENT replies to our own
 		 * EVENT_REQUESTs -- other instruction types can carry unrelated
 		 * requestor values that happen to collide with our REQ_* codes. */
-		if (event.requestor == REQ_PREV) render_and_show(current_page - 1, true);
+		if (event.requestor == REQ_SIDEBAR_TOGGLE) toggle_sidebar();
+		else if (event.requestor == REQ_PREV) render_and_show(current_page - 1, true);
 		else if (event.requestor == REQ_NEXT) render_and_show(current_page + 1);
 		else if (event.requestor == REQ_ZOOM_OUT) set_zoom(zoom_level / ZOOM_STEP);
 		else if (event.requestor == REQ_ZOOM_IN) set_zoom(zoom_level * ZOOM_STEP);
