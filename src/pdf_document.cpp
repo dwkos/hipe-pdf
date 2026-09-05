@@ -2,8 +2,18 @@
 
 #include <mupdf/fitz.h>
 
+#include <condition_variable>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
+#include <thread>
+
+namespace {
+/* A single pathological page (e.g. huge amounts of vector detail) can make MuPDF's rasterizer
+ * spin far longer than any reasonable UI wait -- this bounds it. fz_cookie::abort is documented
+ * as safe to set from another thread without locking. */
+constexpr int RENDER_TIMEOUT_MS = 10000;
+}
 
 PdfDocument::PdfDocument(const std::string& path) : ctx(nullptr), doc(nullptr) {
 	ctx = fz_new_context(nullptr, nullptr, FZ_STORE_DEFAULT);
@@ -56,14 +66,19 @@ std::vector<uint8_t> PdfDocument::renderPagePng(int pageNumber, float targetWidt
 	std::vector<uint8_t> result;
 
 	fz_page* page = nullptr;
+	fz_device* dev = nullptr;
 	fz_pixmap* pix = nullptr;
 	fz_buffer* buf = nullptr;
 	fz_output* out = nullptr;
 
 	fz_var(page);
+	fz_var(dev);
 	fz_var(pix);
 	fz_var(buf);
 	fz_var(out);
+
+	fz_cookie cookie = {0, 0, (size_t) -1, 0, 0};
+	bool timed_out = false;
 
 	fz_try(ctx) {
 		page = fz_load_page(ctx, doc, pageNumber);
@@ -73,23 +88,65 @@ std::vector<uint8_t> PdfDocument::renderPagePng(int pageNumber, float targetWidt
 		float scale = (pageWidth > 0) ? (targetWidthPx / pageWidth) : 1.0f;
 		fz_matrix ctm = fz_scale(scale, scale);
 
-		pix = fz_new_pixmap_from_page(ctx, page, ctm, fz_device_rgb(ctx), 0);
+		fz_irect bbox = fz_round_rect(fz_transform_rect(bounds, ctm));
+		pix = fz_new_pixmap_with_bbox(ctx, fz_device_rgb(ctx), bbox, nullptr, 0);
+		fz_clear_pixmap_with_value(ctx, pix, 0xFF);
 
-		buf = fz_new_buffer(ctx, 4096);
-		out = fz_new_output_with_buffer(ctx, buf);
-		fz_write_pixmap_as_png(ctx, out, pix);
-		fz_close_output(ctx, out);
+		dev = fz_new_draw_device(ctx, ctm, pix);
 
-		unsigned char* data;
-		size_t size = fz_buffer_storage(ctx, buf, &data);
-		result.assign(data, data + size);
+		/* Watchdog: only touches cookie.abort (never another fz_* call), so it's safe to run
+		 * concurrently with fz_run_page even though this fz_context has no locking support.
+		 * Waits on a condition variable rather than a flat sleep so a fast render isn't
+		 * penalized with added latency waiting for the watchdog to notice completion. */
+		std::mutex m;
+		std::condition_variable cv;
+		bool done = false;
+		std::thread watchdog([&]() {
+			std::unique_lock<std::mutex> lock(m);
+			if (!cv.wait_for(lock, std::chrono::milliseconds(RENDER_TIMEOUT_MS), [&] { return done; })) {
+				cookie.abort = 1;
+			}
+		});
+
+		/* fz_identity, not ctm -- the transform is already baked into the device (see
+		 * fz_new_draw_device above); passing it again here would double-apply the scale
+		 * (matches the pattern in MuPDF's own fz_new_pixmap_from_page_with_separations). */
+		fz_run_page(ctx, page, dev, fz_identity, &cookie);
+
+		{
+			std::lock_guard<std::mutex> lock(m);
+			done = true;
+		}
+		cv.notify_one();
+		watchdog.join();
+
+		fz_close_device(ctx, dev);
+
+		if (cookie.abort) {
+			timed_out = true;
+		} else {
+			buf = fz_new_buffer(ctx, 4096);
+			out = fz_new_output_with_buffer(ctx, buf);
+			fz_write_pixmap_as_png(ctx, out, pix);
+			fz_close_output(ctx, out);
+
+			unsigned char* data;
+			size_t size = fz_buffer_storage(ctx, buf, &data);
+			result.assign(data, data + size);
+		}
 	} fz_always(ctx) {
 		if (out) fz_drop_output(ctx, out);
 		if (buf) fz_drop_buffer(ctx, buf);
+		if (dev) fz_drop_device(ctx, dev);
 		if (pix) fz_drop_pixmap(ctx, pix);
 		if (page) fz_drop_page(ctx, page);
 	} fz_catch(ctx) {
 		throw std::runtime_error("renderPagePng: page " + std::to_string(pageNumber) + ": " + fz_caught_message(ctx));
+	}
+
+	if (timed_out) {
+		throw std::runtime_error("renderPagePng: page " + std::to_string(pageNumber) +
+			": timed out after " + std::to_string(RENDER_TIMEOUT_MS) + "ms (page too complex to render)");
 	}
 
 	return result;
