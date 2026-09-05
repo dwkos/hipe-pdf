@@ -750,7 +750,12 @@ int main(int argc, char** argv) {
 	hipe_instruction event;
 	hipe_instruction_init(&event);
 	do {
-		hipe_next_instruction(session, &event, 1);
+		/* Per the Hipe API docs: always check for a -1 return (disconnection) or an
+		 * HIPE_OP_SERVER_DENIED opcode and exit -- otherwise an orphaned client (e.g.
+		 * hiped restarting/crashing out from under it) spins forever, since a blocking
+		 * call can no longer actually block on anything once disconnected. */
+		if (hipe_next_instruction(session, &event, 1) < 0 || event.opcode == HIPE_OP_SERVER_DENIED)
+			break;
 
 		if (event.opcode == HIPE_OP_DIALOG_RETURN) {
 			if (event.requestor == REQ_SLIDESHOW_DIALOG) handle_slideshow_dialog_return(event);
