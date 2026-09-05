@@ -44,7 +44,12 @@ static const float ZOOM_MIN = 0.25f;
 static const float ZOOM_MAX = 4.0f;
 static const float ZOOM_STEP = 1.25f;
 static const float VIEWPORT_MARGIN_PX = 20.0f; /* rough allowance for scrollbars/padding */
-static const float SHADOW_MARGIN_PX = 14.0f; /* room for img_page's box-shadow blur below the page */
+/* Room below the page for img_page's box-shadow (see main()/leave_slideshow) -- its dark
+ * component is offset 3px down-right with a 10px blur, reaching 13px past the page's own
+ * bottom edge, plus a bit of buffer. The complementary light component is offset up-left
+ * instead, so it doesn't add to this. */
+static const float SHADOW_MARGIN_PX = 20.0f;
+static const float SIDEBAR_WIDTH_PX = 140.0f;
 
 enum class FitMode { NONE, WIDTH, PAGE };
 
@@ -54,6 +59,7 @@ static int current_page = 0;
 static int page_count = 0;
 static hipe_loc img_page;
 static hipe_loc page_wrapper;
+static hipe_loc bottom_spacer;
 static hipe_loc page_status;
 static hipe_loc text_layer;
 static hipe_loc viewport;
@@ -63,6 +69,7 @@ static hipe_loc main_area;
 static hipe_loc slideshow_leave_btn;
 static hipe_loc page_label;
 static hipe_loc zoom_label;
+static float navbar_clearance_px = 0.0f; /* measured once after navbar is built -- see main() */
 static float base_render_width = 800.0f;
 static float zoom_level = 1.0f;
 static float render_width = 800.0f;
@@ -128,7 +135,12 @@ static void apply_fit_mode(float aspect_h_over_w, float viewport_w, float viewpo
 	if (fit_mode == FitMode::WIDTH) {
 		render_width = viewport_w - margin;
 	} else if (fit_mode == FitMode::PAGE) {
-		float width_for_height_fit = (viewport_h - margin) / aspect_h_over_w;
+		/* The floating #navbar overlays #viewport rather than shrinking it (see
+		 * #viewport/#navbar in main()), so viewport_h alone would let a fully-fit page's
+		 * top edge land underneath the toolbar. navbar_clearance_px (skipped in
+		 * slideshow, where navbar is hidden entirely) keeps the whole page below it. */
+		float navbar_room = slideshow_active ? 0.0f : navbar_clearance_px;
+		float width_for_height_fit = (viewport_h - margin - navbar_room) / aspect_h_over_w;
 		render_width = std::min(viewport_w - margin, width_for_height_fit);
 	}
 
@@ -299,22 +311,27 @@ static void render_and_show(int page_number, bool land_at_bottom = false) {
 	 * to stay scrollable from the top, which flex align-items:center can't do reliably
 	 * without "safe center" support (unavailable on this WebKit fork). Horizontal
 	 * centering still uses plain auto margins, which degrade correctly on their own.
-	 * The fixed SHADOW_MARGIN_PX margin-bottom is subtracted from the gap before
-	 * centering, so img_page's box-shadow always has a bit of room below it -- otherwise
-	 * it bleeds past #viewport's scrollable content edge and gets clipped there (visible
-	 * right where #navbar starts, since it's #viewport's bottom too). Slideshow disables
-	 * the shadow entirely (see enter_slideshow) and wants a true edge-to-edge fit, so
-	 * neither margin is reserved there. */
-	float shadow_margin = slideshow_active ? 0.0f : SHADOW_MARGIN_PX;
-	float margin_top = slideshow_active ? 0.0f : 10.0f;
-	if (viewport_h > 50.0f && render_height + shadow_margin < viewport_h)
-		margin_top = (viewport_h - render_height - shadow_margin) / 2.0f;
+	 * top_reserve is a MINIMUM margin-top, not just a centering input: the floating
+	 * #navbar docks at #viewport's top edge (see main()), so scrolling to the page's
+	 * actual top must never bring it flush with the top edge, or it'd land right under
+	 * the toolbar. Any extra room beyond that minimum still centers the page in the
+	 * remaining space. bottom_reserve is unrelated -- just img_page's box-shadow blur,
+	 * which would otherwise bleed past #viewport's scrollable content edge and get
+	 * clipped there -- see #bottomSpacer in main() for why this is a sibling element's
+	 * height rather than page_wrapper's own margin-bottom. Slideshow disables the shadow
+	 * and hides navbar entirely (see enter_slideshow) and wants a true edge-to-edge fit,
+	 * so neither is reserved there. */
+	float top_reserve = slideshow_active ? 0.0f : navbar_clearance_px;
+	float bottom_reserve = slideshow_active ? 0.0f : SHADOW_MARGIN_PX;
+	float margin_top = top_reserve;
+	if (viewport_h > 50.0f && render_height + top_reserve + bottom_reserve < viewport_h)
+		margin_top = top_reserve + (viewport_h - render_height - top_reserve - bottom_reserve) / 2.0f;
 	char margin_top_buf[16];
 	snprintf(margin_top_buf, sizeof(margin_top_buf), "%dpx", (int) (margin_top + 0.5f));
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_wrapper, 2, "margin-top", margin_top_buf);
-	char margin_bottom_buf[16];
-	snprintf(margin_bottom_buf, sizeof(margin_bottom_buf), "%dpx", (int) (shadow_margin + 0.5f));
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_wrapper, 2, "margin-bottom", margin_bottom_buf);
+	char spacer_h_buf[16];
+	snprintf(spacer_h_buf, sizeof(spacer_h_buf), "%dpx", (int) (bottom_reserve + 0.5f));
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, bottom_spacer, 2, "height", spacer_h_buf);
 
 	/* A complex page's render can take several seconds (see PdfDocument::renderPagePng's
 	 * timeout) -- show a placeholder immediately rather than leaving the previous page's
@@ -548,7 +565,7 @@ static void leave_slideshow() {
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, sidebar, 2, "display", "block");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "display", "flex");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_leave_btn, 2, "display", "none");
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "box-shadow", "0 0 12px rgba(0,0,0,0.5)");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "box-shadow", "3px 3px 6px rgba(0,0,0,0.55), -6px -6px 5px rgba(255,255,255,0.2)");
 	/* Clear back to Hipe's theme default rather than a hardcoded color (empty value
 	 * removes the inline override -- see HIPE_OP_SET_STYLE notes in CLAUDE.md). */
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, main_area, 2, "background", "");
@@ -682,13 +699,35 @@ int main(int argc, char** argv) {
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, root, 2, "flex-direction", "row");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, root, 2, "height", "100vh");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, root, 2, "width", "100vw");
+	/* background-color: inherit, chained all the way down through main_area/viewport to
+	 * sidebar and navbar below (see those), is what lets both pick up Hipe's theme
+	 * background/fg color (HIPE_THEME, --css) rather than a hardcoded color of their
+	 * own -- background-color isn't naturally inherited like color is, so every link in
+	 * the chain has to ask for it explicitly or the lookup stops at "transparent". */
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, root, 2, "background-color", "inherit");
 
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, root, 2, "div", "sidebar");
 	sidebar = get_by_id("sidebar");
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, sidebar, 2, "width", "140px");
+	char sidebar_width_buf[16];
+	snprintf(sidebar_width_buf, sizeof(sidebar_width_buf), "%dpx", (int) SIDEBAR_WIDTH_PX);
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, sidebar, 2, "width", sidebar_width_buf);
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, sidebar, 2, "overflow-y", "auto");
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, sidebar, 2, "background", "#f0f0f0");
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, sidebar, 2, "border-right", "1px solid #ccc");
+	/* Matches body's theme color (see root above) instead of a hardcoded gray, so it
+	 * reads as one piece of chrome with navbar and with periscope's own body-colormatched
+	 * frame around it. A drop shadow (rather than the old flat border) is what actually
+	 * separates it from the document now -- falling rightward onto #main_area, and
+	 * meeting navbar's own downward shadow at the shared top-left corner so the two read
+	 * as a single L-shaped panel rather than two separately-decorated strips. Paired dark
+	 * + light shadows (rather than just the dark one) borrows periscope's own tooltip/
+	 * button technique (~/periscope/hipe.css) for the same reason it needs it there: with
+	 * sidebar and #main_area now the same inherited theme color, a shadow of only one
+	 * brightness can disappear entirely against whichever theme (dark or light) matches
+	 * its own tone, so both are stacked to guarantee contrast either way. */
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, sidebar, 2, "background-color", "inherit");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, sidebar, 2, "color", "inherit");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, sidebar, 2, "box-shadow", "2px 0 6px rgba(0,0,0,0.35), 2px 0 6px rgba(255,255,255,0.12)");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, sidebar, 2, "position", "relative");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, sidebar, 2, "z-index", "1");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, sidebar, 2, "flex-shrink", "0");
 	build_thumbnail_sidebar(sidebar);
 
@@ -699,11 +738,14 @@ int main(int argc, char** argv) {
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, main_area, 2, "flex-direction", "column");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, main_area, 2, "overflow", "hidden");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, main_area, 2, "position", "relative");
-	/* No background here either -- left transparent so body's theme-supplied color
-	 * shows through behind the page when zoomed out; slideshow overrides it directly. */
+	/* inherit rather than the old bare transparent -- same visual result when nothing
+	 * else overrides it (body's color still shows through around the page when zoomed
+	 * out), but this is also the link slideshow's own explicit background (see
+	 * update_slideshow_background/leave_slideshow) falls back to when cleared. */
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, main_area, 2, "background-color", "inherit");
 
-	/* #viewport scrolls independently of #navbar below it, so a zoomed-in page can be
-	 * panned without the nav controls scrolling out of view. Centering the page image
+	/* #viewport is now the sole child of #main_area (the toolbar floats inside it, see
+	 * navbar below) so flex:1 gives it the full frame height. Centering the page image
 	 * via auto margins (rather than flex align/justify-center) means the CSS degrades
 	 * correctly when the image is bigger than the viewport: auto margins collapse to 0
 	 * instead of clipping the overflow unreachably on both sides. */
@@ -711,6 +753,7 @@ int main(int argc, char** argv) {
 	viewport = get_by_id("viewport");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, viewport, 2, "flex", "1");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, viewport, 2, "overflow", "auto");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, viewport, 2, "background-color", "inherit");
 
 	/* #pageWrapper is sized to exactly the rendered image's box (see render_and_show) and
 	 * carries the centering margins that used to live on img_page directly; img#page and
@@ -724,6 +767,28 @@ int main(int argc, char** argv) {
 	 * for horizontal centering, which doesn't need per-render recomputation. */
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_wrapper, 2, "margin-left", "auto");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_wrapper, 2, "margin-right", "auto");
+	/* Link in the same background-color: inherit chain as root/main_area/viewport (see
+	 * main()) -- not visible behind img_page itself (opaque), but needed so #pageStatus
+	 * below can inherit through it too. */
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_wrapper, 2, "background-color", "inherit");
+
+	/* A real sibling block (in normal flow, after page_wrapper) rather than a margin-
+	 * bottom on page_wrapper itself -- this WebKit fork doesn't count a scrolling
+	 * container's last in-flow child's own trailing margin toward its scrollHeight at
+	 * all (confirmed empirically: querying GET_SCROLL_GEOMETRY showed #viewport's
+	 * scrollHeight exactly equal to page_wrapper's own offsetTop+offsetHeight, with
+	 * margin-bottom contributing nothing whatsoever), so that margin was silently
+	 * capped at zero for scrolling purposes no matter what value was set -- the page's
+	 * bottom (and its shadow) could never actually be scrolled clear of the frame edge.
+	 * A separate element's own height isn't ambiguous "trailing margin" in the same way,
+	 * so it reliably extends scrollHeight instead. Resized to bottom_reserve per render
+	 * (see render_and_show); page_wrapper's own margin-top continues to work fine and is
+	 * unaffected by this (a leading margin on a scrolling container's content, not a
+	 * trailing one, behaves differently in the same engine). */
+	hipe_send(session, HIPE_OP_APPEND_TAG, 0, viewport, 2, "div", "bottomSpacer");
+	bottom_spacer = get_by_id("bottomSpacer");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, bottom_spacer, 2, "width", "1px");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, bottom_spacer, 2, "height", "0px");
 
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, page_wrapper, 2, "img", "page");
 	img_page = get_by_id("page");
@@ -733,7 +798,7 @@ int main(int argc, char** argv) {
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "width", "100%");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "height", "100%");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "background", "white");
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "box-shadow", "0 0 12px rgba(0,0,0,0.5)");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "box-shadow", "3px 3px 6px rgba(0,0,0,0.55), -6px -6px 5px rgba(255,255,255,0.2)");
 
 	/* Experimental: an invisible, selectable text overlay in the Acrobat/PDF.js style --
 	 * real text nodes positioned atop the raster image so the underlying content can be
@@ -759,8 +824,16 @@ int main(int argc, char** argv) {
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "justify-content", "center");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "text-align", "center");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "white-space", "pre-line");
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "background", "rgba(255,255,255,0.9)");
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "color", "#333");
+	/* Theme-matched (inherited, see page_wrapper/root above) rather than a hardcoded
+	 * white panel with dark text -- that read as jarring/out of place against a dark
+	 * theme. Since its fill now matches the surrounding chrome/viewport margin exactly,
+	 * the dashed border below is what actually marks out its extent rather than being
+	 * purely decorative; border-color is left unset so it defaults to currentColor,
+	 * automatically matching whatever fg color came with the inherited theme. */
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "background-color", "inherit");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "color", "inherit");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "border-width", "4px");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "border-style", "dashed");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "font-size", "16px");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "padding", "20px");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "box-sizing", "border-box");
@@ -774,17 +847,61 @@ int main(int argc, char** argv) {
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, text_layer, 2, "height", "100%");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, text_layer, 2, "overflow", "hidden");
 
-	hipe_send(session, HIPE_OP_APPEND_TAG, 0, main_area, 2, "div", "navbar");
+	/* A child of #viewport (not #main_area) but position:fixed, so it floats over the
+	 * document instead of occupying its own row that would shrink the scrollable area,
+	 * "mile-high menubar" style. position:absolute was tried first and doesn't work for
+	 * this: an absolutely-positioned descendant is still part of its containing block's
+	 * own scrollable canvas, so it rode up the screen right along with the page content
+	 * instead of staying put (confirmed live -- this WebKit fork also has no
+	 * position:sticky, confirmed absent from hipecore's CSSValueKeywords.in, which would
+	 * have been the more obvious tool otherwise). position:fixed anchors to the whole
+	 * frame regardless of DOM nesting, which is also why "left" below is offset by
+	 * SIDEBAR_WIDTH_PX rather than just 0 -- fixed ignores #viewport's own on-screen
+	 * position entirely, so without this it would land at the frame's true left edge,
+	 * underneath the sidebar, rather than at #viewport's.
+	 *
+	 * Docked at the TOP (not the bottom): a horizontal scrollbar (once zoomed in wider
+	 * than the viewport) only ever renders along the bottom edge of a scrolling
+	 * container, and Hipe's GET_GEOMETRY has no clientWidth/clientHeight equivalent (only
+	 * offsetWidth/offsetHeight, which don't exclude scrollbars), so there was no reliable
+	 * way to measure a real scrollbar's thickness and keep the toolbar clear of it down
+	 * there. Docking at the top sidesteps the problem entirely rather than guessing a
+	 * safety margin -- there's never a scrollbar up there to fight with, and the toolbar
+	 * is nowhere near full width so it doesn't reach the vertical scrollbar on the right
+	 * either. Flush against #viewport's own top-left corner (no margin/gap here, and
+	 * border-radius dropped below) rather than floating with a gap like the old
+	 * bottom-docked version did -- a rounded corner sitting hard against the real corner
+	 * of the frame just looked wrong. */
+	hipe_send(session, HIPE_OP_APPEND_TAG, 0, viewport, 2, "div", "navbar");
 	navbar = get_by_id("navbar");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "display", "flex");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "align-items", "center");
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "margin", "6px 10px");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "position", "fixed");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "top", "0");
+	{
+		char navbar_left_buf[16];
+		snprintf(navbar_left_buf, sizeof(navbar_left_buf), "%dpx", (int) SIDEBAR_WIDTH_PX);
+		hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "left", navbar_left_buf);
+	}
+	/* #pageStatus (the loading/error overlay, see main()) sets z-index:2 to sit above
+	 * img_page/text_layer within #pageWrapper -- navbar has no competing z-index of its
+	 * own by default, so despite being position:fixed it could still lose that stacking
+	 * comparison and end up layered under the overlay instead of over it, same as it
+	 * already correctly sits over ordinary scrolled page content. Comfortably higher
+	 * than #pageStatus's 2 to make sure it wins. */
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "z-index", "10");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "padding", "4px 8px");
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "border-radius", "6px");
-	/* Fixed toolbar colors, independent of the theme color showing through #viewport
-	 * behind the page -- otherwise light text can vanish against a light theme. */
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "background", "rgba(0,0,0,0.65)");
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "color", "white");
+	/* Matches body's theme color (see root in main()) instead of a hardcoded black, so it
+	 * reads as one piece of chrome with sidebar and with periscope's own body-colormatched
+	 * frame. A downward drop shadow (meeting sidebar's rightward one at their shared
+	 * top-left corner) is what separates it from the document now, instead of the old
+	 * flat semi-transparent panel look -- paired dark+light for the same reason as
+	 * sidebar's (see its comment): a single-brightness shadow can disappear against a
+	 * same-toned theme, so both are stacked (matching periscope's own tooltip/button
+	 * technique in ~/periscope/hipe.css) to guarantee contrast on light or dark themes. */
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "background-color", "inherit");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "color", "inherit");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "box-shadow", "0 2px 6px rgba(0,0,0,0.35), 0 2px 6px rgba(255,255,255,0.12)");
 	/* Icon-first buttons (prev/next/fit) are only one or two glyphs wide -- a fixed
 	 * min-width keeps them from shrinking to an uncomfortably small click target,
 	 * and a larger font-size keeps the symbols themselves legible. Spacing between
@@ -862,6 +979,17 @@ int main(int argc, char** argv) {
 	 * The desktop-computer glyph in front is just a visual cue, not a replacement
 	 * for the label. */
 	hipe_send(session, HIPE_OP_APPEND_TEXT, 0, slideshow_btn, 1, "\xf0\x9f\x92\xbb Slideshow" /* 💻 Slideshow */);
+
+	/* Measured once now that navbar's real content/padding/font-size are all set -- used
+	 * in render_and_show to reserve enough space above the page that scrolling to its top
+	 * doesn't leave it hidden under the floating toolbar. Doesn't need remeasuring later:
+	 * navbar's own height doesn't change across states (button/label text lengths vary
+	 * but not the row height). */
+	{
+		float navbar_h = 0;
+		get_geometry(navbar, nullptr, &navbar_h);
+		navbar_clearance_px = navbar_h + 12.0f; /* + a little breathing room below it */
+	}
 
 	/* Overlay button, only shown once slideshow mode hides the sidebar/navbar -- a
 	 * guaranteed way to exit that doesn't depend on right-click dialog support, which
