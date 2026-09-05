@@ -8,13 +8,6 @@
 #include <stdexcept>
 #include <thread>
 
-namespace {
-/* A single pathological page (e.g. huge amounts of vector detail) can make MuPDF's rasterizer
- * spin far longer than any reasonable UI wait -- this bounds it. fz_cookie::abort is documented
- * as safe to set from another thread without locking. */
-constexpr int RENDER_TIMEOUT_MS = 10000;
-}
-
 PdfDocument::PdfDocument(const std::string& path) : ctx(nullptr), doc(nullptr) {
 	ctx = fz_new_context(nullptr, nullptr, FZ_STORE_DEFAULT);
 	if (!ctx)
@@ -62,7 +55,7 @@ void PdfDocument::pageSize(int pageNumber, float* widthPts, float* heightPts) co
 	}
 }
 
-std::vector<uint8_t> PdfDocument::renderPagePng(int pageNumber, float targetWidthPx) const {
+std::vector<uint8_t> PdfDocument::renderPagePng(int pageNumber, float targetWidthPx, int timeoutMs) const {
 	std::vector<uint8_t> result;
 
 	fz_page* page = nullptr;
@@ -103,7 +96,7 @@ std::vector<uint8_t> PdfDocument::renderPagePng(int pageNumber, float targetWidt
 		bool done = false;
 		std::thread watchdog([&]() {
 			std::unique_lock<std::mutex> lock(m);
-			if (!cv.wait_for(lock, std::chrono::milliseconds(RENDER_TIMEOUT_MS), [&] { return done; })) {
+			if (!cv.wait_for(lock, std::chrono::milliseconds(timeoutMs), [&] { return done; })) {
 				cookie.abort = 1;
 			}
 		});
@@ -146,7 +139,7 @@ std::vector<uint8_t> PdfDocument::renderPagePng(int pageNumber, float targetWidt
 
 	if (timed_out) {
 		throw std::runtime_error("renderPagePng: page " + std::to_string(pageNumber) +
-			": timed out after " + std::to_string(RENDER_TIMEOUT_MS) + "ms (page too complex to render)");
+			": timed out after " + std::to_string(timeoutMs) + "ms (page too complex to render)");
 	}
 
 	return result;

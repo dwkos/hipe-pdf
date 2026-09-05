@@ -41,6 +41,20 @@
 
 static const float ARROW_SCROLL_STEP_PX = 60.0f;
 static const float THUMB_WIDTH_PX = 110.0f;
+/* Fallback used when a page times out at its intended resolution (see render_and_show).
+ * Tuned empirically against a real stress-test file rather than assumed: probing a range
+ * of widths against its worst (10s-timeout) page showed render time scaling roughly
+ * LINEARLY with width for that page, not with pixel count/area as first assumed -- e.g.
+ * 110px took ~3.9s, 200px ~6.4s, 300px ~10.3s, 350px ~13.1s, and 500px still hadn't
+ * finished at 15s. That rules out pushing the fallback width very far up (350px, initially
+ * chosen for legibility, actually needs MORE time than the original attempt's own 10s
+ * budget for a page this bad) and rules out a short fallback timeout (even the 110px
+ * thumbnail size needs several seconds here, well past an initially-assumed 3s). 200px
+ * with a generous-over-its-measured-6.4s timeout is a size that's still meaningfully
+ * bigger/more legible than THUMB_WIDTH_PX while leaving real margin for a page that scales
+ * similarly, and still meaningfully shorter than the original budget for one that doesn't. */
+static const float LOW_RES_FALLBACK_WIDTH_PX = 200.0f;
+static const int LOW_RES_FALLBACK_TIMEOUT_MS = 8000;
 static const float ZOOM_MIN = 0.25f;
 static const float ZOOM_MAX = 4.0f;
 static const float ZOOM_STEP = 1.25f;
@@ -91,6 +105,11 @@ static float saved_zoom_level = 1.0f;
  * two both mean false. Set false whenever the page actually changes (see
  * render_and_show), true right after a successful render, left untouched on failure. */
 static bool current_page_has_raster = false;
+/* True when the raster currently on screen for current_page came from the low-res
+ * fallback attempt (see render_and_show) rather than the originally requested
+ * resolution -- reflected in the page label so it's clear the softness is a deliberate
+ * degraded result, not a rendering bug. Reset alongside current_page_has_raster. */
+static bool current_page_is_low_res = false;
 static bool wheel_stuck = false;
 static std::chrono::steady_clock::time_point wheel_stuck_since;
 static std::chrono::steady_clock::time_point wheel_cooldown_until;
@@ -120,8 +139,11 @@ static void get_geometry(hipe_loc target, float* out_w, float* out_h, float* out
 }
 
 static void update_page_label() {
-	char buf[64];
-	snprintf(buf, sizeof(buf), "Page %d / %d", current_page + 1, page_count);
+	char buf[80];
+	if (current_page_is_low_res)
+		snprintf(buf, sizeof(buf), "Page %d / %d (low-res)", current_page + 1, page_count);
+	else
+		snprintf(buf, sizeof(buf), "Page %d / %d", current_page + 1, page_count);
 	hipe_send(session, HIPE_OP_SET_TEXT, 0, page_label, 1, buf);
 }
 
@@ -292,7 +314,10 @@ static void render_and_show(int page_number, bool land_at_bottom = false) {
 	bool page_changed = (page_number != current_page);
 	int previous_page = current_page; /* for a less-jarring loading-placeholder color below */
 	current_page = page_number;
-	if (page_changed) current_page_has_raster = false; /* whatever img_page shows now is for a different page */
+	if (page_changed) {
+		current_page_has_raster = false; /* whatever img_page shows now is for a different page */
+		current_page_is_low_res = false;
+	}
 
 	float page_w = 0, page_h = 0;
 	try {
@@ -390,35 +415,52 @@ static void render_and_show(int page_number, bool land_at_bottom = false) {
 	is_busy = true;
 	hipe_send(session, HIPE_OP_SET_CURSOR, 0, 0, 1, "\xe2\x9a\x99" /* ⚙ */);
 	std::vector<uint8_t> png;
+	bool low_res_fallback = false;
 	try {
 		png = doc->renderPagePng(current_page, render_width);
 	} catch (const std::exception& e) {
-		is_busy = false;
-		hipe_send(session, HIPE_OP_SET_CURSOR, 0, 0, 1, "");
-		fprintf(stderr, "Failed to render page %d: %s\n", current_page, e.what());
-		char err_buf[128];
-		snprintf(err_buf, sizeof(err_buf),
-			"Page %d could not be rendered\n(ludicrously complex, or timed out)", current_page + 1);
-		/* Back to the theme-inherited look (see main()) for the error state specifically --
-		 * unlike the loading placeholder, an error is deliberately distinct chrome rather
-		 * than something that should blend in with the page content. */
-		hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "background-color", "inherit");
-		hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "color", "inherit");
-		show_page_status(err_buf);
+		fprintf(stderr, "Failed to render page %d at %.0fpx: %s\n", current_page, render_width, e.what());
+		/* A much smaller raster from the same pathological page is often (not always)
+		 * tractable well within a fraction of the original budget: rasterization/AA cost
+		 * scales with pixel count, and plenty of real pathological pages turn out to be
+		 * bound by that rather than by content-stream complexity -- confirmed
+		 * empirically (a stress-test file's own sidebar thumbnail, rendered at
+		 * THUMB_WIDTH_PX, succeeded on a page whose full-resolution render timed out).
+		 * Worth one more, cheaper attempt before giving up outright. The shorter
+		 * LOW_RES_FALLBACK_TIMEOUT_MS reflects that: if this doesn't finish quickly, it's
+		 * not going to, and there's no reason to make the user wait a second full budget. */
+		try {
+			png = doc->renderPagePng(current_page, LOW_RES_FALLBACK_WIDTH_PX, LOW_RES_FALLBACK_TIMEOUT_MS);
+			low_res_fallback = true;
+		} catch (const std::exception& e2) {
+			is_busy = false;
+			hipe_send(session, HIPE_OP_SET_CURSOR, 0, 0, 1, "");
+			fprintf(stderr, "Low-res fallback for page %d also failed: %s\n", current_page, e2.what());
+			char err_buf[128];
+			snprintf(err_buf, sizeof(err_buf),
+				"Page %d could not be rendered\n(ludicrously complex, or timed out)", current_page + 1);
+			/* Back to the theme-inherited look (see main()) for the error state specifically --
+			 * unlike the loading placeholder, an error is deliberately distinct chrome rather
+			 * than something that should blend in with the page content. */
+			hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "background-color", "inherit");
+			hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "color", "inherit");
+			show_page_status(err_buf);
 
-		/* current_page really has moved to the failed page (so a repeated Next/Prev keeps
-		 * making forward progress instead of getting stuck) -- keep the label/thumbnail
-		 * highlight/scroll state in sync with that rather than silently leaving them
-		 * pointing at the old page while the status overlay shows a different one. */
-		update_page_label();
-		highlight_thumbnail(current_page);
-		scroll_thumbnail_into_view(current_page);
-		wheel_stuck = false;
-		last_render_finished_at = std::chrono::steady_clock::now();
-		if (page_changed)
-			hipe_send(session, HIPE_OP_SCROLL_TO, 0, viewport, 3, (char*) nullptr, "0", "%");
-		return;
+			/* current_page really has moved to the failed page (so a repeated Next/Prev keeps
+			 * making forward progress instead of getting stuck) -- keep the label/thumbnail
+			 * highlight/scroll state in sync with that rather than silently leaving them
+			 * pointing at the old page while the status overlay shows a different one. */
+			update_page_label();
+			highlight_thumbnail(current_page);
+			scroll_thumbnail_into_view(current_page);
+			wheel_stuck = false;
+			last_render_finished_at = std::chrono::steady_clock::now();
+			if (page_changed)
+				hipe_send(session, HIPE_OP_SCROLL_TO, 0, viewport, 3, (char*) nullptr, "0", "%");
+			return;
+		}
 	}
+	current_page_is_low_res = low_res_fallback;
 	is_busy = false;
 	hipe_send(session, HIPE_OP_SET_CURSOR, 0, 0, 1, "");
 	hide_page_status();

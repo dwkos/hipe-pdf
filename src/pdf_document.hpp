@@ -25,11 +25,17 @@ public:
 	/* Native page size in PDF points (1/72 inch), without rasterizing it. Throws
 	 * std::runtime_error on failure. */
 
-	std::vector<uint8_t> renderPagePng(int pageNumber, float targetWidthPx) const;
+	static constexpr int DEFAULT_RENDER_TIMEOUT_MS = 10000;
+
+	std::vector<uint8_t> renderPagePng(int pageNumber, float targetWidthPx,
+		int timeoutMs = DEFAULT_RENDER_TIMEOUT_MS) const;
 	/* Rasterizes the given 0-indexed page to a PNG image scaled so its width matches
 	 * targetWidthPx (height follows the page's aspect ratio). Throws std::runtime_error
-	 * on failure, including if the render takes too long (a pathologically complex page is
-	 * aborted after a fixed timeout rather than hanging indefinitely). */
+	 * on failure, including if the render takes longer than timeoutMs (a pathologically
+	 * complex page is aborted rather than left to hang indefinitely) -- callers willing to
+	 * accept a lower-resolution fallback can retry at a smaller targetWidthPx and/or a
+	 * shorter timeoutMs, since a much smaller raster from the same pathological page is
+	 * often (not guaranteed) tractable well within a fraction of the original budget. */
 
 	void pageBackgroundColor(int pageNumber, uint8_t* r, uint8_t* g, uint8_t* b) const;
 	/* Cheap heuristic for chrome-matching purposes (e.g. a slideshow surround): renders
