@@ -913,14 +913,16 @@ static void show_slideshow_dialog() {
 		current_page + 1, page_count, clock_buf, slideshow_elapsed_buf, slide_elapsed_buf);
 
 	/* arg[3] symbols line up 1:1 with the arg[2] choices, plus one trailing symbol for
-	 * the dialog itself: prev=\xe2\x97\x80, next=\xe2\x96\xb6, start=\xe2\x8f\xae,
+	 * the dialog itself: prev=U+23F4 \xe2\x8f\xb4, next=U+23F5 \xe2\x8f\xb5 (same media-
+	 * control glyph family as the Menu button's U+23F6, and matching the toolbar's own
+	 * prev/next buttons -- see prev_btn/next_btn below), start=\xe2\x8f\xae,
 	 * end=\xe2\x8f\xad, leave=\xe2\x9c\x95, dialog icon=laptop (\xf0\x9f\x92\xbb) --
 	 * matches the toolbar's own Slideshow button glyph rather than reusing "next"'s
 	 * triangle for the dialog itself. */
 	hipe_send(session, HIPE_OP_DIALOG, REQ_SLIDESHOW_DIALOG, 0, 4,
 		"Slideshow", prompt_buf,
 		"Previous page\nNext page\nGo to start\nGo to end\nLeave slideshow",
-		"\xe2\x97\x80\n\xe2\x96\xb6\n\xe2\x8f\xae\n\xe2\x8f\xad\n\xe2\x9c\x95\n\xf0\x9f\x92\xbb");
+		"\xe2\x8f\xb4\n\xe2\x8f\xb5\n\xe2\x8f\xae\n\xe2\x8f\xad\n\xe2\x9c\x95\n\xf0\x9f\x92\xbb");
 }
 
 static void handle_slideshow_dialog_return(const hipe_instruction& reply) {
@@ -1356,7 +1358,7 @@ int main(int argc, char** argv) {
 
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, page_group, 2, "button", "prevBtn");
 	hipe_loc prev_btn = get_by_id("prevBtn");
-	hipe_send(session, HIPE_OP_APPEND_TEXT, 0, prev_btn, 1, "\xe2\x97\x80" /* ◀ */);
+	hipe_send(session, HIPE_OP_APPEND_TEXT, 0, prev_btn, 1, "\xe2\x8f\xb4" /* U+23F4 ⏴, matches the slideshow dialog's own prev symbol */);
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, prev_btn, 2, "margin-right", ITEM_MARGIN);
 
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, page_group, 2, "span", "pageLabel");
@@ -1365,7 +1367,7 @@ int main(int argc, char** argv) {
 
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, page_group, 2, "button", "nextBtn");
 	hipe_loc next_btn = get_by_id("nextBtn");
-	hipe_send(session, HIPE_OP_APPEND_TEXT, 0, next_btn, 1, "\xe2\x96\xb6" /* ▶ */);
+	hipe_send(session, HIPE_OP_APPEND_TEXT, 0, next_btn, 1, "\xe2\x8f\xb5" /* U+23F5 ⏵, matches the slideshow dialog's own next symbol */);
 
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, navbar, 2, "div", "zoomGroup");
 	hipe_loc zoom_group = get_by_id("zoomGroup");
