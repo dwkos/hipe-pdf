@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <memory>
 #include <string>
 #include <vector>
@@ -112,6 +113,12 @@ static float zoom_level = 1.0f;
 static float render_width = 800.0f;
 static FitMode fit_mode = FitMode::NONE;
 static bool slideshow_active = false;
+static std::chrono::steady_clock::time_point slideshow_started_at; /* set in enter_slideshow() */
+/* Reset whenever the current page actually changes (see render_and_show), regardless of
+ * slideshow_active -- consumed by show_slideshow_dialog() to show how long the presenter
+ * has lingered on the current slide, a real signal of "am I running long on this one" in
+ * the middle of a talk. */
+static std::chrono::steady_clock::time_point slide_shown_at;
 static bool sidebar_visible = true;
 static bool is_busy = false; /* true while a render_and_show call is blocked inside renderPagePng */
 static FitMode saved_fit_mode = FitMode::NONE;
@@ -575,8 +582,10 @@ static void render_and_show(int page_number, bool land_at_bottom = false) {
 			scroll_thumbnail_into_view(current_page);
 			wheel_stuck = false;
 			last_render_finished_at = std::chrono::steady_clock::now();
-			if (page_changed)
+			if (page_changed) {
+				slide_shown_at = last_render_finished_at;
 				hipe_send(session, HIPE_OP_SCROLL_TO, 0, viewport, 3, (char*) nullptr, "0", "%");
+			}
 			return;
 		}
 	}
@@ -613,8 +622,10 @@ static void render_and_show(int page_number, bool land_at_bottom = false) {
 	 * page-changing navigation lands at the top (or bottom, for backward navigation,
 	 * matching a continuous-reading feel); re-rendering the *same* page for a zoom/fit
 	 * change must NOT touch scroll position, so this is skipped when page didn't change. */
-	if (page_changed)
+	if (page_changed) {
+		slide_shown_at = last_render_finished_at;
 		hipe_send(session, HIPE_OP_SCROLL_TO, 0, viewport, 3, (char*) nullptr, land_at_bottom ? "100" : "0", "%");
+	}
 }
 
 static const auto WHEEL_EDGE_DWELL = std::chrono::milliseconds(250);
@@ -766,6 +777,16 @@ static void toggle_sidebar() {
 
 static void enter_slideshow() {
 	slideshow_active = true;
+	/* Both reset here, not just slideshow_started_at: whatever page happens to already be
+	 * on screen becomes "freshly shown" the moment the presenter actually starts
+	 * presenting, regardless of how long it had been sitting there during casual
+	 * browsing beforehand. Also covers a real edge case: render_and_show only resets
+	 * slide_shown_at when the page number actually changes, which doesn't happen if
+	 * slideshow is entered while already on the same page as the app's very first
+	 * (startup) render -- without this, that leaves slide_shown_at at its
+	 * default-constructed epoch, showing a nonsense multi-decade "time on this slide". */
+	slideshow_started_at = std::chrono::steady_clock::now();
+	slide_shown_at = slideshow_started_at;
 	saved_fit_mode = fit_mode;
 	saved_zoom_level = zoom_level;
 
@@ -812,14 +833,45 @@ static void leave_slideshow() {
 	else set_fit_mode(saved_fit_mode);
 }
 
+static void format_duration(std::chrono::steady_clock::duration d, char* buf, size_t buf_size) {
+	long total_seconds = (long) std::chrono::duration_cast<std::chrono::seconds>(d).count();
+	if (total_seconds < 0) total_seconds = 0; /* clock skew safety net, shouldn't happen with steady_clock */
+	long h = total_seconds / 3600;
+	long m = (total_seconds % 3600) / 60;
+	long s = total_seconds % 60;
+	if (h > 0) snprintf(buf, buf_size, "%ld:%02ld:%02ld", h, m, s);
+	else snprintf(buf, buf_size, "%ld:%02ld", m, s);
+}
+
 static void show_slideshow_dialog() {
-	/* arg[3] symbols line up 1:1 with the arg[2] choices, plus one trailing symbol
-	 * for the dialog itself: prev=\xe2\x97\x80, next=\xe2\x96\xb6, start=\xe2\x8f\xae,
-	 * end=\xe2\x8f\xad, leave=\xe2\x9c\x95, dialog icon=\xe2\x96\xb6 again. */
+	/* Replaces a static "Choose an action:" prompt with live info that actually matters
+	 * mid-presentation: where you are in the deck, the wall-clock time (for a hard
+	 * finish-by deadline), how long the whole talk has run, and how long you've lingered
+	 * on THIS slide specifically -- a real "am I running long on this one" signal that a
+	 * presenter can't otherwise see once slideshow mode has hidden all normal chrome. */
+	auto now = std::chrono::steady_clock::now();
+	char slideshow_elapsed_buf[16], slide_elapsed_buf[16], clock_buf[16], prompt_buf[160];
+	format_duration(now - slideshow_started_at, slideshow_elapsed_buf, sizeof(slideshow_elapsed_buf));
+	format_duration(now - slide_shown_at, slide_elapsed_buf, sizeof(slide_elapsed_buf));
+
+	time_t t = time(nullptr);
+	struct tm local_tm;
+	localtime_r(&t, &local_tm);
+	strftime(clock_buf, sizeof(clock_buf), "%I:%M %p", &local_tm);
+
+	snprintf(prompt_buf, sizeof(prompt_buf),
+		"Page %d of %d  \xc2\xb7  %s\nTotal time: %s  \xc2\xb7  This slide: %s",
+		current_page + 1, page_count, clock_buf, slideshow_elapsed_buf, slide_elapsed_buf);
+
+	/* arg[3] symbols line up 1:1 with the arg[2] choices, plus one trailing symbol for
+	 * the dialog itself: prev=\xe2\x97\x80, next=\xe2\x96\xb6, start=\xe2\x8f\xae,
+	 * end=\xe2\x8f\xad, leave=\xe2\x9c\x95, dialog icon=laptop (\xf0\x9f\x92\xbb) --
+	 * matches the toolbar's own Slideshow button glyph rather than reusing "next"'s
+	 * triangle for the dialog itself. */
 	hipe_send(session, HIPE_OP_DIALOG, REQ_SLIDESHOW_DIALOG, 0, 4,
-		"Slideshow", "Choose an action:",
+		"Slideshow", prompt_buf,
 		"Previous page\nNext page\nGo to start\nGo to end\nLeave slideshow",
-		"\xe2\x97\x80\n\xe2\x96\xb6\n\xe2\x8f\xae\n\xe2\x8f\xad\n\xe2\x9c\x95\n\xe2\x96\xb6");
+		"\xe2\x97\x80\n\xe2\x96\xb6\n\xe2\x8f\xae\n\xe2\x8f\xad\n\xe2\x9c\x95\n\xf0\x9f\x92\xbb");
 }
 
 static void handle_slideshow_dialog_return(const hipe_instruction& reply) {
