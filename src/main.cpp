@@ -55,6 +55,20 @@ static const float THUMB_WIDTH_PX = 110.0f;
  * similarly, and still meaningfully shorter than the original budget for one that doesn't. */
 static const float LOW_RES_FALLBACK_WIDTH_PX = 200.0f;
 static const int LOW_RES_FALLBACK_TIMEOUT_MS = 8000;
+/* A page's thumbnail render (see build_thumbnail_sidebar) taking this many times longer
+ * than the batch's own median is treated as real evidence that page itself is unusually
+ * complex, rather than the machine being transiently busy -- see page_is_flagged_complex.
+ * 4x is deliberately generous: false positives just cost a smart_starting_width guess
+ * instead of trying render_width first (still no timeout-budget penalty either way, see
+ * render_and_show), so there's little downside to erring toward not flagging borderline
+ * pages. */
+static const float COMPLEXITY_FLAG_MULTIPLIER = 4.0f;
+/* Target wall-clock budget (ms) smart_starting_width extrapolates a starting width
+ * against -- comfortably under DEFAULT_RENDER_TIMEOUT_MS (10s) so the first attempt at a
+ * flagged page's smart-chosen width has real margin to still land inside its budget even
+ * if the linear-with-width extrapolation from a single small thumbnail data point is
+ * imperfect. */
+static const double SMART_WIDTH_TARGET_BUDGET_MS = 7000.0;
 static const float ZOOM_MIN = 0.25f;
 static const float ZOOM_MAX = 4.0f;
 static const float ZOOM_STEP = 1.25f;
@@ -115,6 +129,14 @@ static std::chrono::steady_clock::time_point wheel_stuck_since;
 static std::chrono::steady_clock::time_point wheel_cooldown_until;
 static std::chrono::steady_clock::time_point last_render_finished_at;
 static std::vector<hipe_loc> thumb_locs;
+/* Per-page wall-clock time (ms) the eager thumbnail render took, and the median across
+ * the whole document -- see build_thumbnail_sidebar/page_is_flagged_complex/
+ * smart_starting_width. A page whose thumbnail took much longer than most others in the
+ * SAME batch (same machine, same moment, so any transient system-wide lag affects all of
+ * them roughly equally) is real evidence that page itself is unusually complex, not just
+ * that the machine was busy right then. */
+static std::vector<double> thumb_render_ms;
+static double thumb_render_ms_median = 0.0;
 
 static hipe_loc get_by_id(const char* id) {
 	hipe_send(session, HIPE_OP_GET_BY_ID, 0, 0, 1, id);
@@ -182,6 +204,28 @@ static void apply_fit_mode(float aspect_h_over_w, float viewport_w, float viewpo
 
 	render_width = std::max(render_width, 50.0f);
 	zoom_level = render_width / base_render_width;
+}
+
+static bool page_is_flagged_complex(int page_number) {
+	if (page_number < 0 || page_number >= (int) thumb_render_ms.size()) return false;
+	if (thumb_render_ms_median <= 0.0) return false; /* no data (e.g. thumbnails not built yet) */
+	return thumb_render_ms[page_number] > thumb_render_ms_median * COMPLEXITY_FLAG_MULTIPLIER;
+}
+
+static float smart_starting_width(int page_number, float intended_width) {
+	/* Extrapolates a starting width from the page's own thumbnail time via the linear
+	 * width/time relationship measured empirically for pathological pages (see
+	 * LOW_RES_FALLBACK_WIDTH_PX's comment) -- i.e. assumes render_ms is roughly
+	 * proportional to width for a given page, so scaling THUMB_WIDTH_PX by the ratio of
+	 * the target budget to the thumbnail's own measured time estimates the width that
+	 * would take about that long. Clamped so a flagged page never gets a wider first
+	 * attempt than it would've had anyway (intended_width), nor a smaller one than the
+	 * separate low-res fallback tier already tries (no point in a "smart" width that's
+	 * just a worse version of that safety net). */
+	double thumb_ms = thumb_render_ms[page_number];
+	if (thumb_ms <= 0.0) return intended_width;
+	float estimated = THUMB_WIDTH_PX * (float) (SMART_WIDTH_TARGET_BUDGET_MS / thumb_ms);
+	return std::max(LOW_RES_FALLBACK_WIDTH_PX, std::min(intended_width, estimated));
 }
 
 static void highlight_thumbnail(int page_number) {
@@ -416,10 +460,20 @@ static void render_and_show(int page_number, bool land_at_bottom = false) {
 	hipe_send(session, HIPE_OP_SET_CURSOR, 0, 0, 1, "\xe2\x9a\x99" /* ⚙ */);
 	std::vector<uint8_t> png;
 	bool low_res_fallback = false;
+	/* A page whose own thumbnail render took far longer than the batch's median (see
+	 * page_is_flagged_complex) gets a smaller, evidence-based first-attempt width instead
+	 * of render_width -- still tried with the full default timeout it would've gotten
+	 * anyway, so this never costs a flagged page any patience it would otherwise have
+	 * had, only gives it a real shot at succeeding directly instead of predictably
+	 * burning the whole budget failing at render_width first. Unflagged pages are
+	 * completely unaffected: first_attempt_width just equals render_width for them. */
+	bool complex_flag = page_is_flagged_complex(current_page);
+	float first_attempt_width = complex_flag ? smart_starting_width(current_page, render_width) : render_width;
 	try {
-		png = doc->renderPagePng(current_page, render_width);
+		png = doc->renderPagePng(current_page, first_attempt_width);
+		if (complex_flag && first_attempt_width < render_width) low_res_fallback = true;
 	} catch (const std::exception& e) {
-		fprintf(stderr, "Failed to render page %d at %.0fpx: %s\n", current_page, render_width, e.what());
+		fprintf(stderr, "Failed to render page %d at %.0fpx: %s\n", current_page, first_attempt_width, e.what());
 		/* A much smaller raster from the same pathological page is often (not always)
 		 * tractable well within a fraction of the original budget: rasterization/AA cost
 		 * scales with pixel count, and plenty of real pathological pages turn out to be
@@ -718,15 +772,25 @@ static void build_thumbnail_sidebar(hipe_loc sidebar) {
 	 * scroll-driven variant (matching the continuous-scroll stretch goal)
 	 * would be needed for very large page counts. */
 	thumb_locs.reserve(page_count);
+	thumb_render_ms.reserve(page_count);
 	for (int i = 0; i < page_count; i++) {
 		std::vector<uint8_t> thumb_png;
+		auto render_start = std::chrono::steady_clock::now();
 		try {
 			thumb_png = doc->renderPagePng(i, THUMB_WIDTH_PX);
 		} catch (const std::exception& e) {
+			/* Still record the elapsed time even on failure/timeout -- a thumbnail that
+			 * timed out is itself the strongest possible complexity signal (it already
+			 * took the full DEFAULT_RENDER_TIMEOUT_MS at the smallest size we ever
+			 * render), not a lack of data. */
+			thumb_render_ms.push_back(std::chrono::duration<double, std::milli>(
+				std::chrono::steady_clock::now() - render_start).count());
 			fprintf(stderr, "Failed to render thumbnail %d: %s\n", i, e.what());
 			thumb_locs.push_back(0);
 			continue;
 		}
+		thumb_render_ms.push_back(std::chrono::duration<double, std::milli>(
+			std::chrono::steady_clock::now() - render_start).count());
 
 		hipe_send(session, HIPE_OP_APPEND_TAG, 0, sidebar, 1, "img");
 		hipe_loc thumb = hipe_newest_location();
@@ -750,6 +814,21 @@ static void build_thumbnail_sidebar(hipe_loc sidebar) {
 		hipe_send_instruction(session, instr);
 
 		hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_THUMB_BASE + i, thumb, 1, "click");
+	}
+
+	/* Median rather than mean so a handful of genuinely pathological pages (which is
+	 * exactly what this table exists to find) can't drag the baseline up and mask each
+	 * other -- see page_is_flagged_complex. */
+	if (!thumb_render_ms.empty()) {
+		std::vector<double> sorted = thumb_render_ms;
+		std::sort(sorted.begin(), sorted.end());
+		/* Lower-middle element (not upper) for an even count: with very few pages -- a
+		 * 2-page document is a real, common case -- the upper-middle element of a sorted
+		 * pair IS the larger value, so a single outlier page would BE its own "median"
+		 * and could never exceed COMPLEXITY_FLAG_MULTIPLIER times itself. Confirmed via
+		 * live testing against a real 2-page stress-test file: page 2's genuinely
+		 * pathological page went undetected until switching to this convention. */
+		thumb_render_ms_median = sorted[(sorted.size() - 1) / 2];
 	}
 }
 
