@@ -64,11 +64,15 @@ static const int LOW_RES_FALLBACK_TIMEOUT_MS = 8000;
  * pages. */
 static const float COMPLEXITY_FLAG_MULTIPLIER = 4.0f;
 /* Target wall-clock budget (ms) smart_starting_width extrapolates a starting width
- * against -- comfortably under DEFAULT_RENDER_TIMEOUT_MS (10s) so the first attempt at a
- * flagged page's smart-chosen width has real margin to still land inside its budget even
- * if the linear-with-width extrapolation from a single small thumbnail data point is
- * imperfect. */
-static const double SMART_WIDTH_TARGET_BUDGET_MS = 7000.0;
+ * against -- under DEFAULT_RENDER_TIMEOUT_MS (10s) so the first attempt at a flagged
+ * page's smart-chosen width still has some margin to land inside its budget even if the
+ * linear-with-width extrapolation from a single small thumbnail data point is imperfect,
+ * but deliberately close to it rather than conservatively far below: 10s was always the
+ * accepted per-page wait (the original hard timeout), so a legible page that lands in 8-9s
+ * is a better outcome than an artificially small one that returns quickly. If this proves
+ * too aggressive in practice (flagged pages timing out instead of landing), the fallback
+ * tier below still catches it -- just at the cost of a wasted first attempt. */
+static const double SMART_WIDTH_TARGET_BUDGET_MS = 9000.0;
 static const float ZOOM_MIN = 0.25f;
 static const float ZOOM_MAX = 4.0f;
 static const float ZOOM_STEP = 1.25f;
