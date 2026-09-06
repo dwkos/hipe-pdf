@@ -2,6 +2,7 @@
 
 #include <mupdf/fitz.h>
 
+#include <cmath>
 #include <condition_variable>
 #include <cstring>
 #include <mutex>
@@ -206,6 +207,20 @@ std::vector<PdfDocument::TextSpan> PdfDocument::pageTextSpans(int pageNumber) co
 		for (fz_stext_block* block = stext->first_block; block; block = block->next) {
 			if (block->type != FZ_STEXT_BLOCK_TEXT) continue;
 			for (fz_stext_line* line = block->u.t.first_line; line; line = line->next) {
+				/* Skip rotated/angled lines (e.g. street names following a diagonal
+				 * road on a map) -- line->bbox is axis-aligned, so for a tilted line
+				 * its "height" is actually dominated by the text's rotated reading
+				 * length, not its font size. The caller (see update_text_layer in
+				 * main.cpp) derives font-size directly from bbox height, so a
+				 * skewed line there produces a wildly oversized span -- invisible
+				 * normally (the overlay is fully transparent) but revealed as a
+				 * giant selection-highlighted mess the moment it's selected, which
+				 * also visibly stalls this WebKit fork given enough such spans to
+				 * hit-test. dir is the line's normalized baseline direction ((1,0)
+				 * for plain horizontal text); a generous tilt tolerance still allows
+				 * slightly-skewed-but-basically-horizontal text through. */
+				if (fabsf(line->dir.y) > 0.2f) continue;
+
 				std::string text;
 				for (fz_stext_char* ch = line->first_char; ch; ch = ch->next) {
 					char utf8[4];
