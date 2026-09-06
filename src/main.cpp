@@ -28,6 +28,9 @@
 #define REQ_ZOOM_RESET 15
 #define REQ_SIDEBAR_TOGGLE 16
 #define REQ_THUMB_BASE 1000
+/* Far above REQ_THUMB_BASE's own range (REQ_THUMB_BASE + page_count) so the two ranges
+ * can never collide regardless of document length -- see update_link_layer/dispatch. */
+#define REQ_LINK_BASE 100000
 
 /* DOM KeyboardEvent.keyCode values (legacy, but what this WebKit fork's
  * keydown detail string actually carries -- see requestEvent() in
@@ -95,6 +98,7 @@ static hipe_loc page_wrapper;
 static hipe_loc bottom_spacer;
 static hipe_loc page_status;
 static hipe_loc text_layer;
+static hipe_loc link_layer;
 static hipe_loc viewport;
 static hipe_loc sidebar;
 static hipe_loc navbar;
@@ -141,6 +145,16 @@ static std::vector<hipe_loc> thumb_locs;
  * that the machine was busy right then. */
 static std::vector<double> thumb_render_ms;
 static double thumb_render_ms_median = 0.0;
+/* Resolved click target for each link overlay element currently in #linkLayer, indexed by
+ * (event.requestor - REQ_LINK_BASE) -- see update_link_layer/the event dispatch loop.
+ * Rebuilt from scratch on every render_and_show call, same lifecycle as the elements
+ * themselves (cleared and recreated alongside #linkLayer's contents). */
+struct ResolvedLink {
+	bool is_external;
+	std::string uri; /* only meaningful when is_external */
+	int target_page; /* only meaningful when !is_external */
+};
+static std::vector<ResolvedLink> current_page_links;
 
 static hipe_loc get_by_id(const char* id) {
 	hipe_send(session, HIPE_OP_GET_BY_ID, 0, 0, 1, id);
@@ -348,6 +362,52 @@ static void update_text_layer(int page_number, float scale) {
 	}
 }
 
+static void update_link_layer(int page_number, float scale) {
+	hipe_send(session, HIPE_OP_CLEAR, 0, link_layer, 0);
+	current_page_links.clear();
+
+	std::vector<PdfDocument::PageLink> links;
+	try {
+		links = doc->pageLinks(page_number);
+	} catch (const std::exception& e) {
+		fprintf(stderr, "update_link_layer: %s\n", e.what());
+		return;
+	}
+
+	char buf[16];
+	for (const auto& link : links) {
+		/* Skip anything unresolvable up front (an internal link MuPDF couldn't map to a
+		 * page) rather than register a click target that would silently do nothing --
+		 * both the DOM element and current_page_links stay in lockstep this way, indexed
+		 * by (event.requestor - REQ_LINK_BASE) without gaps. */
+		if (!link.is_external && link.target_page < 0) continue;
+
+		hipe_send(session, HIPE_OP_APPEND_TAG, 0, link_layer, 1, "div");
+		hipe_loc loc = hipe_newest_location();
+
+		/* Common properties (position:absolute, cursor:pointer, etc.) come from the
+		 * "#linkLayer div" rule added once at startup; only per-link geometry and the
+		 * click registration need setting here. */
+		snprintf(buf, sizeof(buf), "%dpx", (int) (link.x * scale));
+		hipe_send(session, HIPE_OP_SET_STYLE, 0, loc, 2, "left", buf);
+		snprintf(buf, sizeof(buf), "%dpx", (int) (link.y * scale));
+		hipe_send(session, HIPE_OP_SET_STYLE, 0, loc, 2, "top", buf);
+		snprintf(buf, sizeof(buf), "%dpx", (int) (link.width * scale));
+		hipe_send(session, HIPE_OP_SET_STYLE, 0, loc, 2, "width", buf);
+		snprintf(buf, sizeof(buf), "%dpx", (int) (link.height * scale));
+		hipe_send(session, HIPE_OP_SET_STYLE, 0, loc, 2, "height", buf);
+
+		int requestor = REQ_LINK_BASE + (int) current_page_links.size();
+		hipe_send(session, HIPE_OP_EVENT_REQUEST, requestor, loc, 1, "click");
+
+		ResolvedLink resolved;
+		resolved.is_external = link.is_external;
+		resolved.uri = link.uri;
+		resolved.target_page = link.target_page;
+		current_page_links.push_back(std::move(resolved));
+	}
+}
+
 static void show_page_status(const char* message) {
 	hipe_send(session, HIPE_OP_SET_TEXT, 0, page_status, 1, message);
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "display", "flex");
@@ -434,9 +494,11 @@ static void render_and_show(int page_number, bool land_at_bottom = false) {
 	 * socket with no client-side buffering, so when the placeholder IS needed, it
 	 * reaches the display before the CPU-bound render below starts. */
 	if (!current_page_has_raster) {
-		/* Drop the old page's text spans now rather than leaving them selectable
-		 * underneath the overlay. */
+		/* Drop the old page's text spans and link targets now rather than leaving them
+		 * selectable/clickable underneath the overlay. */
 		hipe_send(session, HIPE_OP_CLEAR, 0, text_layer, 0);
+		hipe_send(session, HIPE_OP_CLEAR, 0, link_layer, 0);
+		current_page_links.clear();
 
 		/* Colored to match the page just being left (previous_page -- on the very first
 		 * ever render this is current_page itself, which works out fine too: sampling
@@ -535,6 +597,7 @@ static void render_and_show(int page_number, bool land_at_bottom = false) {
 	current_page_has_raster = true;
 
 	update_text_layer(current_page, render_width / (page_w > 0 ? page_w : render_width));
+	update_link_layer(current_page, render_width / (page_w > 0 ? page_w : render_width));
 
 	if (slideshow_active) update_slideshow_background(current_page);
 
@@ -888,6 +951,14 @@ int main(int argc, char** argv) {
 	hipe_send(session, HIPE_OP_ADD_STYLE_RULE, 0, 0, 2, "#textLayer span",
 		"position:absolute; color:transparent; white-space:nowrap; overflow:visible; cursor:text; "
 		"-webkit-user-select:text; user-select:text;");
+	/* Shared link-overlay div properties; per-link geometry is set individually in
+	 * update_link_layer(). user-select:none so a click-drag starting on a link doesn't
+	 * fight with the text layer underneath for a selection instead of registering as a
+	 * click. pointer-events:auto opts each individual link div back into hit-testing --
+	 * see #linkLayer's own pointer-events:none below for why that's needed at all. */
+	hipe_send(session, HIPE_OP_ADD_STYLE_RULE, 0, 0, 2, "#linkLayer div",
+		"position:absolute; cursor:pointer; pointer-events:auto; "
+		"-webkit-user-select:none; user-select:none;");
 
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, 0, 2, "div", "root");
 	hipe_loc root = get_by_id("root");
@@ -1042,6 +1113,34 @@ int main(int argc, char** argv) {
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, text_layer, 2, "width", "100%");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, text_layer, 2, "height", "100%");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, text_layer, 2, "overflow", "hidden");
+
+	/* Appended after (so painted above -- see #linkLayer's "div" rule above) text_layer:
+	 * a link's clickable area should win a click over the selectable text underneath it
+	 * (e.g. a URL rendered as visible page text that's also a live hyperlink), same
+	 * reasoning as #pageStatus's explicit z-index over both -- given via z-index (not
+	 * just DOM order) for the same "don't rely on it, be explicit" reason page_status
+	 * already is, comfortably below page_status's own 2 so the loading/error overlay
+	 * still wins over both when shown. */
+	hipe_send(session, HIPE_OP_APPEND_TAG, 0, page_wrapper, 2, "div", "linkLayer");
+	link_layer = get_by_id("linkLayer");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, link_layer, 2, "position", "absolute");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, link_layer, 2, "top", "0");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, link_layer, 2, "left", "0");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, link_layer, 2, "width", "100%");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, link_layer, 2, "height", "100%");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, link_layer, 2, "overflow", "hidden");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, link_layer, 2, "z-index", "1");
+	/* Confirmed against hipecore's own source (RenderElement::visibleToHitTesting) that
+	 * pointer-events genuinely gates hit-testing here, not just parses harmlessly like
+	 * some other CSS this fork accepts but ignores -- essential, not decorative: without
+	 * this, the container's own full-page box (blank everywhere except at actual link
+	 * rects) sits topmost and swallows every click/drag-select on the ENTIRE page, not
+	 * just within real links. Confirmed live: a text drag-select that worked before this
+	 * layer existed silently selected nothing once it was added, until this fix. Each
+	 * individual link div opts back in via its own pointer-events:auto (see the
+	 * "#linkLayer div" rule above), so only their specific small rects intercept
+	 * anything. */
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, link_layer, 2, "pointer-events", "none");
 
 	/* A child of #viewport (not #main_area) but position:fixed, so it floats over the
 	 * document instead of occupying its own row that would shrink the scrollable area,
@@ -1286,6 +1385,18 @@ int main(int argc, char** argv) {
 		}
 		else if (event.requestor == REQ_WHEEL) handle_wheel_event(parse_wheel_delta_y(event.arg[1]));
 		else if (event.requestor == REQ_RESIZE && fit_mode != FitMode::NONE) render_and_show(current_page);
+		/* Checked before the REQ_THUMB_BASE range below despite both being open-ended
+		 * ">=" comparisons -- REQ_LINK_BASE sits far above REQ_THUMB_BASE's own range
+		 * specifically so a link click can never be misread as an out-of-range thumbnail
+		 * click, but only if this check runs first. */
+		else if (event.requestor >= REQ_LINK_BASE) {
+			int idx = (int) (event.requestor - REQ_LINK_BASE);
+			if (idx >= 0 && idx < (int) current_page_links.size()) {
+				const auto& link = current_page_links[idx];
+				if (link.is_external) hipe_send(session, HIPE_OP_OPEN_LINK, 0, 0, 1, link.uri.c_str());
+				else render_and_show(link.target_page);
+			}
+		}
 		else if (event.requestor >= REQ_THUMB_BASE) render_and_show((int) (event.requestor - REQ_THUMB_BASE));
 	} while (event.opcode != HIPE_OP_FRAME_CLOSE);
 

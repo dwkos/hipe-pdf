@@ -246,3 +246,46 @@ std::vector<PdfDocument::TextSpan> PdfDocument::pageTextSpans(int pageNumber) co
 
 	return spans;
 }
+
+std::vector<PdfDocument::PageLink> PdfDocument::pageLinks(int pageNumber) const {
+	std::vector<PageLink> result;
+
+	fz_page* page = nullptr;
+	fz_link* links = nullptr;
+	fz_var(page);
+	fz_var(links);
+
+	fz_try(ctx) {
+		page = fz_load_page(ctx, doc, pageNumber);
+		links = fz_load_links(ctx, page);
+
+		for (fz_link* link = links; link; link = link->next) {
+			if (!link->uri || !link->uri[0]) continue; /* no destination -- nothing to do on click */
+
+			PageLink pl;
+			pl.x = link->rect.x0;
+			pl.y = link->rect.y0;
+			pl.width = link->rect.x1 - link->rect.x0;
+			pl.height = link->rect.y1 - link->rect.y0;
+			pl.is_external = fz_is_external_link(ctx, link->uri);
+			pl.target_page = -1;
+
+			if (pl.is_external) {
+				pl.uri = link->uri;
+			} else {
+				fz_location loc = fz_resolve_link(ctx, doc, link->uri, nullptr, nullptr);
+				if (loc.chapter >= 0)
+					pl.target_page = fz_page_number_from_location(ctx, doc, loc);
+			}
+
+			result.push_back(std::move(pl));
+		}
+	} fz_always(ctx) {
+		if (links) fz_drop_link(ctx, links);
+		if (page) fz_drop_page(ctx, page);
+	} fz_catch(ctx) {
+		throw std::runtime_error("pageLinks: page " + std::to_string(pageNumber) + ": " + fz_caught_message(ctx));
+	}
+
+	return result;
+}

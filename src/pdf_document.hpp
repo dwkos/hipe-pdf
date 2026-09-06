@@ -53,6 +53,21 @@ public:
 	 * the raster render (positions/sizes are in PDF points -- the caller scales them by
 	 * the same factor used for the raster width). Throws std::runtime_error on failure. */
 
+	struct PageLink {
+		float x, y, width, height; /* PDF points, same page space as TextSpan */
+		bool is_external; /* true: uri is a real URL (open via the display server/
+			framing manager); false: an internal link -- target_page is what to jump to */
+		std::string uri;
+		int target_page; /* 0-indexed, flat across chapters (see fz_page_number_from_location);
+			-1 if internal but unresolvable. Meaningless when is_external. */
+	};
+
+	std::vector<PageLink> pageLinks(int pageNumber) const;
+	/* One entry per clickable link region on the page (hyperlinks and internal page-jump
+	 * links), for building a clickable overlay atop the raster render the same way
+	 * pageTextSpans builds the selectable text overlay -- positions/sizes are in PDF
+	 * points, scaled by the caller the same way. Throws std::runtime_error on failure. */
+
 private:
 	fz_context* ctx;
 	fz_document* doc;
