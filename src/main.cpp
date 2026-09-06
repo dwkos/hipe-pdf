@@ -523,7 +523,8 @@ static void render_and_show(int page_number, bool land_at_bottom = false) {
 		hipe_send(session, HIPE_OP_SET_STYLE, 0, page_status, 2, "color", luminance > 128.0 ? "black" : "white");
 
 		char loading_buf[64];
-		snprintf(loading_buf, sizeof(loading_buf), "Loading page %d / %d...", current_page + 1, page_count);
+		snprintf(loading_buf, sizeof(loading_buf), "Loading %s %d / %d...",
+			slideshow_active ? "slide" : "page", current_page + 1, page_count);
 		show_page_status(loading_buf);
 		update_page_label();
 		highlight_thumbnail(current_page);
@@ -565,7 +566,8 @@ static void render_and_show(int page_number, bool land_at_bottom = false) {
 			fprintf(stderr, "Low-res fallback for page %d also failed: %s\n", current_page, e2.what());
 			char err_buf[128];
 			snprintf(err_buf, sizeof(err_buf),
-				"Page %d could not be rendered\n(ludicrously complex, or timed out)", current_page + 1);
+				"%s %d could not be rendered\n(ludicrously complex, or timed out)",
+				slideshow_active ? "Slide" : "Page", current_page + 1);
 			/* Back to the theme-inherited look (see main()) for the error state specifically --
 			 * unlike the loading placeholder, an error is deliberately distinct chrome rather
 			 * than something that should blend in with the page content. */
@@ -859,8 +861,13 @@ static void show_slideshow_dialog() {
 	localtime_r(&t, &local_tm);
 	strftime(clock_buf, sizeof(clock_buf), "%I:%M %p", &local_tm);
 
+	/* Clock on its own line rather than crammed alongside the slide count -- the previous
+	 * "Slide X of Y  ·  clock" layout looked cramped in practice (periscope's dialog
+	 * renders this as plain text, where repeated literal spaces collapse the same way
+	 * HTML text does, so padding with extra spaces didn't actually add visual room; a
+	 * real newline is the only reliable way to separate them). */
 	snprintf(prompt_buf, sizeof(prompt_buf),
-		"Page %d of %d  \xc2\xb7  %s\nTotal time: %s  \xc2\xb7  This slide: %s",
+		"Slide %d of %d\n%s\nTotal time: %s  \xc2\xb7  This slide: %s",
 		current_page + 1, page_count, clock_buf, slideshow_elapsed_buf, slide_elapsed_buf);
 
 	/* arg[3] symbols line up 1:1 with the arg[2] choices, plus one trailing symbol for
