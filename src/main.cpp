@@ -10,6 +10,7 @@
 #include <ctime>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #define REQ_PREV 1
@@ -150,6 +151,10 @@ static std::chrono::steady_clock::time_point last_render_finished_at;
  * click/gesture that just caused hide_slideshow_controls() to run (e.g. a click-to-
  * advance) -- see hide_slideshow_controls(). */
 static std::chrono::steady_clock::time_point slideshow_controls_reveal_cooldown_until;
+/* Authoritative "is the Menu/Leave pair currently faded in" flag -- see
+ * reveal_slideshow_controls()/hide_slideshow_controls()/the main loop's idle-fade poll. */
+static bool slideshow_controls_visible = false;
+static std::chrono::steady_clock::time_point slideshow_controls_last_shown_at;
 static std::vector<hipe_loc> thumb_locs;
 /* Per-page wall-clock time (ms) the eager thumbnail render took, and the median across
  * the whole document -- see build_thumbnail_sidebar/page_is_flagged_complex/
@@ -432,10 +437,25 @@ static void hide_page_status() {
 }
 
 static const auto SLIDESHOW_CONTROLS_REVEAL_COOLDOWN = std::chrono::milliseconds(400);
+/* How long the pair stays visible with no mouse movement before fading itself back out --
+ * the classic PowerPoint presenter-view behavior this whole feature is modeled on. Checked
+ * by the main loop's idle-poll while slideshow_active (see main()). */
+static const auto SLIDESHOW_CONTROLS_IDLE_TIMEOUT = std::chrono::milliseconds(3000);
 
 static void reveal_slideshow_controls() {
 	if (std::chrono::steady_clock::now() < slideshow_controls_reveal_cooldown_until) return;
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_controls, 2, "display", "flex");
+	/* Refresh the idle clock on every real movement, not just the first one after a hide
+	 * -- this is what actually keeps the pair up while the mouse keeps moving. */
+	slideshow_controls_last_shown_at = std::chrono::steady_clock::now();
+	if (slideshow_controls_visible) return;
+	slideshow_controls_visible = true;
+	/* opacity/pointer-events, not display -- display:none can't be CSS-transitioned, and
+	 * this is meant to fade, not snap. #slideshowControls stays display:flex permanently
+	 * (see its DOM setup); pointer-events:none while faded out keeps a technically-still-
+	 * present-but-invisible container from intercepting clicks meant for the slide
+	 * beneath it (same reasoning as #textLayer/#linkLayer's own pointer-events handling). */
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_controls, 2, "opacity", "1");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_controls, 2, "pointer-events", "auto");
 }
 
 static void hide_slideshow_controls() {
@@ -446,7 +466,15 @@ static void hide_slideshow_controls() {
 	 * left the Menu/Leave pair visible again right after, despite the hide call itself
 	 * definitely having run. */
 	slideshow_controls_reveal_cooldown_until = std::chrono::steady_clock::now() + SLIDESHOW_CONTROLS_REVEAL_COOLDOWN;
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_controls, 2, "display", "none");
+	slideshow_controls_visible = false;
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_controls, 2, "opacity", "0");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_controls, 2, "pointer-events", "none");
+}
+
+static void check_slideshow_controls_idle_timeout() {
+	if (!slideshow_controls_visible) return;
+	if (std::chrono::steady_clock::now() - slideshow_controls_last_shown_at >= SLIDESHOW_CONTROLS_IDLE_TIMEOUT)
+		hide_slideshow_controls();
 }
 
 static void render_and_show(int page_number, bool land_at_bottom = false) {
@@ -1433,13 +1461,20 @@ int main(int argc, char** argv) {
 	 * Wrapped in one flex container so both fade in/out together (see
 	 * reveal_slideshow_controls/hide_slideshow_controls) rather than needing to toggle
 	 * each button's own display individually; margin-right on the first button stands in
-	 * for a flex "gap" (not supported by this WebKit fork, confirmed earlier). */
+	 * for a flex "gap" (not supported by this WebKit fork, confirmed earlier). Bottom-left,
+	 * old-PowerPoint-presenter-view style, rather than top-right. display stays flex
+	 * permanently -- display:none/block can't be CSS-transitioned, and reveal/hide fades
+	 * via opacity+pointer-events instead (see those functions) so the pair genuinely fades
+	 * rather than snapping in/out. */
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, main_area, 2, "div", "slideshowControls");
 	slideshow_controls = get_by_id("slideshowControls");
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_controls, 2, "display", "none");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_controls, 2, "display", "flex");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_controls, 2, "opacity", "0");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_controls, 2, "pointer-events", "none");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_controls, 2, "transition", "opacity 0.4s ease");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_controls, 2, "position", "absolute");
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_controls, 2, "top", "10px");
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_controls, 2, "right", "10px");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_controls, 2, "bottom", "10px");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_controls, 2, "left", "10px");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_controls, 2, "align-items", "center");
 
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, slideshow_controls, 2, "button", "slideshowMenuBtn");
@@ -1490,12 +1525,27 @@ int main(int argc, char** argv) {
 	hipe_instruction event;
 	hipe_instruction_init(&event);
 	do {
+		/* Only while slideshow_active does this loop need to wake up on its own (to
+		 * notice the Menu/Leave pair's idle-fade timeout has elapsed with no new event
+		 * having arrived to trigger a check) -- outside slideshow there's nothing to poll
+		 * for, so the normal indefinite blocking wait is used, exactly as before, to avoid
+		 * spending any CPU when nothing is happening (per this project's "lean/efficient"
+		 * goal). blocking=0 returns immediately with 0 if nothing is queued. */
+		short got = hipe_next_instruction(session, &event, slideshow_active ? 0 : 1);
 		/* Per the Hipe API docs: always check for a -1 return (disconnection) or an
 		 * HIPE_OP_SERVER_DENIED opcode and exit -- otherwise an orphaned client (e.g.
 		 * hiped restarting/crashing out from under it) spins forever, since a blocking
-		 * call can no longer actually block on anything once disconnected. */
-		if (hipe_next_instruction(session, &event, 1) < 0 || event.opcode == HIPE_OP_SERVER_DENIED)
+		 * call can no longer actually block on anything once disconnected. Only check
+		 * event.opcode when got > 0 -- with got == 0 (nothing queued, only possible in
+		 * the non-blocking/slideshow case above) event was never written this iteration
+		 * and still holds whatever the previous iteration left in it. */
+		if (got < 0 || (got > 0 && event.opcode == HIPE_OP_SERVER_DENIED))
 			break;
+		if (got == 0) {
+			check_slideshow_controls_idle_timeout();
+			std::this_thread::sleep_for(std::chrono::milliseconds(150));
+			continue;
+		}
 
 		if (event.opcode == HIPE_OP_DIALOG_RETURN) {
 			if (event.requestor == REQ_SLIDESHOW_DIALOG) handle_slideshow_dialog_return(event);
