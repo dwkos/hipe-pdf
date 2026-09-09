@@ -58,9 +58,12 @@
  * rasterises the glyph to an SVG cursor in the frame's fg/bg colours), not as CSS `cursor:`
  * keywords -- the native cursors those map to don't render on some embedded hosts. Matches
  * periscope's convention (its default is U+1F87C). U+1F87C is a NW-pointing arrow whose tip
- * sits at the server's fixed 0,7 hotspot; the busy cursor is a gear. */
-#define CURSOR_DEFAULT "\xf0\x9f\xa1\xbc" /* 🡼 U+1F87C -- NW arrow, matches server hotspot */
-#define CURSOR_POINTER "\xf0\x9f\x91\x86" /* 👆 U+1F446 -- over clickable chrome (buttons, links, thumbnails) */
+ * sits at the server's fixed 0,7 hotspot; the busy cursor is a gear. The arrow is the
+ * default almost everywhere (buttons and thumbnails included); the hand is reserved for the
+ * two things that aren't obviously clickable from their appearance -- hyperlinks in the page
+ * and the zoom-percent label. */
+#define CURSOR_DEFAULT "\xf0\x9f\xa1\xbc" /* 🡼 U+1F87C -- NW arrow, matches server hotspot; the default */
+#define CURSOR_POINTER "\xf0\x9f\x91\x86" /* 👆 U+1F446 -- hyperlinks and the clickable zoom label only */
 #define CURSOR_TEXT    "\xe2\x8c\xb6"     /* ⌶ U+2336 -- over the selectable text overlay */
 #define CURSOR_BUSY    "\xe2\x9a\x99"     /* ⚙ U+2699 -- during a slow page render */
 
@@ -1489,10 +1492,10 @@ int main(int argc, char** argv) {
 	/* Cursors are unicode glyphs set with SET_CURSOR, never CSS `cursor:` keywords (see the
 	 * CURSOR_* defines). `cursor:inherit` on `*` stops <button> etc. from falling back to
 	 * their native cursor, so setting SET_CURSOR on a container is enough for all its
-	 * descendants (including ones appended later, e.g. link divs / text spans / thumbnails).
-	 * The body default is set here; navbar/sidebar/overlays override it below;
-	 * render_and_show() swaps to CURSOR_BUSY around a slow render. Same approach as
-	 * periscope's Screen. */
+	 * descendants (including ones appended later, e.g. link divs / text spans). The body
+	 * default (arrow) covers almost everything; only #textLayer, #linkLayer and the zoom
+	 * label override it below. render_and_show() swaps to CURSOR_BUSY around a slow render.
+	 * Same approach as periscope's Screen. */
 	hipe_send(session, HIPE_OP_ADD_STYLE_RULE, 0, 0, 2, "*", "cursor:inherit;");
 	hipe_send(session, HIPE_OP_SET_CURSOR, 0, 0, 1, CURSOR_DEFAULT);
 	/* Shared text-overlay span properties; per-span geometry is set individually in
@@ -1542,7 +1545,6 @@ int main(int argc, char** argv) {
 
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, root, 2, "div", "sidebar");
 	sidebar = get_by_id("sidebar");
-	hipe_send(session, HIPE_OP_SET_CURSOR, 0, sidebar, 1, CURSOR_POINTER); /* thumbnails inherit */
 	char sidebar_width_buf[16];
 	snprintf(sidebar_width_buf, sizeof(sidebar_width_buf), "%dpx", (int) SIDEBAR_WIDTH_PX);
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, sidebar, 2, "width", sidebar_width_buf);
@@ -1647,7 +1649,6 @@ int main(int argc, char** argv) {
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, empty_state, 2, "justify-content", "center");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, empty_state, 2, "text-align", "center");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, empty_state, 2, "white-space", "pre-line");
-	hipe_send(session, HIPE_OP_SET_CURSOR, 0, empty_state, 1, CURSOR_POINTER); /* whole panel opens a file */
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, empty_state, 2, "background-color", "inherit");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, empty_state, 2, "color", "inherit");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, empty_state, 2, "font-size", "15px");
@@ -1773,7 +1774,6 @@ int main(int argc, char** argv) {
 	 * of the frame just looked wrong. */
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, viewport, 2, "div", "navbar");
 	navbar = get_by_id("navbar");
-	hipe_send(session, HIPE_OP_SET_CURSOR, 0, navbar, 1, CURSOR_POINTER); /* buttons + zoom label inherit; page label overridden below */
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "display", "flex");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "align-items", "center");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "position", "fixed");
@@ -1856,7 +1856,6 @@ int main(int argc, char** argv) {
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, page_group, 2, "span", "pageLabel");
 	page_label = get_by_id("pageLabel");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_label, 2, "margin-right", ITEM_MARGIN);
-	hipe_send(session, HIPE_OP_SET_CURSOR, 0, page_label, 1, CURSOR_DEFAULT); /* just a readout -- not clickable, unlike its navbar siblings */
 
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, page_group, 2, "button", "nextBtn");
 	hipe_loc next_btn = get_by_id("nextBtn");
@@ -1876,9 +1875,10 @@ int main(int argc, char** argv) {
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, zoom_group, 2, "span", "zoomLabel");
 	zoom_label = get_by_id("zoomLabel");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, zoom_label, 2, "margin-right", ITEM_MARGIN);
-	/* Clicking the label itself resets to 100% zoom; it inherits navbar's CURSOR_POINTER
-	 * (the only affordance for this -- no tooltip support to spell it out otherwise), unlike
-	 * the sibling pageLabel which is overridden back to the default arrow. */
+	/* Clicking the label itself resets to 100% zoom -- CURSOR_POINTER is the only affordance
+	 * for this (no tooltip support to spell it out). It and hyperlinks are the only things
+	 * that get the hand; buttons/thumbnails keep the default arrow. */
+	hipe_send(session, HIPE_OP_SET_CURSOR, 0, zoom_label, 1, CURSOR_POINTER);
 
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, zoom_group, 2, "button", "zoomInBtn");
 	hipe_loc zoom_in_btn = get_by_id("zoomInBtn");
@@ -1933,7 +1933,6 @@ int main(int argc, char** argv) {
 	 * rather than snapping in/out. */
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, main_area, 2, "div", "slideshowControls");
 	slideshow_controls = get_by_id("slideshowControls");
-	hipe_send(session, HIPE_OP_SET_CURSOR, 0, slideshow_controls, 1, CURSOR_POINTER); /* Menu / Leave buttons inherit */
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_controls, 2, "display", "flex");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_controls, 2, "opacity", "0");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_controls, 2, "pointer-events", "none");
