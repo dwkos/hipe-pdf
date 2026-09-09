@@ -377,7 +377,12 @@ static void update_slideshow_background(int page_number) {
 	double luminance = 0.299 * r + 0.587 * g + 0.114 * b;
 	const char* fg = (luminance > 128.0) ? "black" : "white";
 
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, main_area, 2, "background", color_buf);
+	/* background-color longhand, not the "background" shorthand: the shorthand also wipes
+	 * background-image etc., so clearing it in leave_slideshow can't put #main_area's
+	 * original "background-color: inherit" back (nothing in any stylesheet targets
+	 * #main_area to fall back to), leaving it -- and #viewport/#navbar, which inherit from
+	 * it -- transparent. Setting just the longhand keeps leave_slideshow's restore simple. */
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, main_area, 2, "background-color", color_buf);
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, /*body*/ 0, 2, "background-color", color_buf);
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, /*body*/ 0, 2, "color", fg);
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_leave_btn, 2, "color", fg);
@@ -960,9 +965,11 @@ static void leave_slideshow() {
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "display", "flex");
 	hide_slideshow_controls();
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "box-shadow", "3px 3px 6px rgba(0,0,0,0.55), -6px -6px 5px rgba(255,255,255,0.2)");
-	/* Clear back to Hipe's theme default rather than a hardcoded color (empty value
-	 * removes the inline override -- see HIPE_OP_SET_STYLE notes in CLAUDE.md). */
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, main_area, 2, "background", "");
+	/* #main_area is restored to its main()-set "background-color: inherit" explicitly (no
+	 * stylesheet rule targets it, so an empty value would strand it at transparent and
+	 * take #viewport/#navbar, which inherit from it, down with it). #body has a theme rule
+	 * to fall back to, so clearing its inline override is enough. */
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, main_area, 2, "background-color", "inherit");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, /*body*/ 0, 2, "background-color", "");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, /*body*/ 0, 2, "color", "");
 	hipe_send(session, HIPE_OP_EVENT_CANCEL, 0, main_area, 1, "contextmenu");
@@ -1577,10 +1584,10 @@ int main(int argc, char** argv) {
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, main_area, 2, "flex-direction", "column");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, main_area, 2, "overflow", "hidden");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, main_area, 2, "position", "relative");
-	/* inherit rather than the old bare transparent -- same visual result when nothing
-	 * else overrides it (body's color still shows through around the page when zoomed
-	 * out), but this is also the link slideshow's own explicit background (see
-	 * update_slideshow_background/leave_slideshow) falls back to when cleared. */
+	/* inherit rather than a bare transparent -- same visual result when nothing else
+	 * overrides it (body's color shows through around the page when zoomed out), and it's
+	 * what leave_slideshow explicitly re-sets after slideshow's own opaque override, since
+	 * no stylesheet rule targets #main_area for an empty value to fall back to. */
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, main_area, 2, "background-color", "inherit");
 
 	/* #viewport is now the sole child of #main_area (the toolbar floats inside it, see
