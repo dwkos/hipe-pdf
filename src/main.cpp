@@ -200,6 +200,19 @@ struct ResolvedLink {
 };
 static std::vector<ResolvedLink> current_page_links;
 
+/* Opt-in tracing for the FIFO import/export handshakes (client and host), which run against
+ * a framing manager and so can't be stepped through here. Set HIPE_PDF_DEBUG=1 to see how
+ * far an exchange gets on stderr. */
+static bool debug_enabled() {
+	static int v = -1;
+	if (v < 0) {
+		const char* e = getenv("HIPE_PDF_DEBUG");
+		v = (e && e[0] && e[0] != '0') ? 1 : 0;
+	}
+	return v;
+}
+#define DBG(...) do { if (debug_enabled()) { fprintf(stderr, "hipe-pdf: " __VA_ARGS__); fflush(stderr); } } while (0)
+
 static hipe_loc get_by_id(const char* id) {
 	hipe_send(session, HIPE_OP_GET_BY_ID, 0, 0, 1, id);
 	hipe_instruction instr;
@@ -1225,15 +1238,18 @@ static std::vector<uint8_t> read_fifo_resource(const char* fifo_path) {
 		return {};
 	}
 
+	DBG("client: pipe %s open, sent FIFO_OPEN, awaiting host echo\n", fifo_path);
 	hipe_send(session, HIPE_OP_FIFO_OPEN, 0, 0, 2, fifo_path, "r");
 
 	hipe_instruction ack;
 	hipe_instruction_init(&ack);
 	hipe_await_instruction(session, &ack, HIPE_OP_FIFO_OPEN); /* host's "my write end is open" echo */
 	hipe_instruction_clear(&ack);
+	DBG("client: got host FIFO_OPEN echo, draining\n");
 
 	std::vector<uint8_t> bytes = drain_fifo(fd, "read_fifo_resource");
 	close(fd);
+	DBG("client: drained %zu bytes\n", bytes.size());
 
 	/* Tell the host we're done: close this transfer, then drop the peer entirely (a viewer
 	 * only ever reads the file once -- there's no save-back). */
@@ -1244,6 +1260,8 @@ static std::vector<uint8_t> read_fifo_resource(const char* fifo_path) {
 
 static void handle_fifo_response(const hipe_instruction& ev) {
 	const char* path = ev.arg[0];
+	DBG("FIFO_RESPONSE: path='%s' modes='%s' name='%s'\n",
+		path ? path : "", ev.arg[1] ? ev.arg[1] : "", ev.arg[2] ? ev.arg[2] : "");
 	if (!path || !path[0]) {
 		/* Blank arg[0] == the user cancelled the picker, or the host rejected the request.
 		 * Leave whatever is on screen (empty state, or the current document) as-is. */
@@ -1282,8 +1300,15 @@ static void handle_fifo_response(const hipe_instruction& ev) {
  * receive a PDF (HIPE_OP_FIFO_ADD_ABILITY). When a file shell then does "open with...", the
  * framing manager relays its HIPE_OP_FIFO_GET_PEER to us with the chosen ability name in
  * arg[3]; handle_incoming_fifo_get_peer() creates a pipe, answers with HIPE_OP_FIFO_RESPONSE,
- * runs the reader side of the OPEN handshake, drains the bytes the shell writes, and loads
- * them -- the same accept_document() path the Open button uses.
+ * opens the pipe for reading straight away (+ echoes FIFO_OPEN), drains the bytes the shell
+ * writes, and loads them -- the same accept_document() path the Open button uses.
+ *
+ * Verified against periscope's relay (peer-list.cc / fiforequestmenu.cc): the file shell
+ * sends FIFO_GET_PEER -> periscope's peer picker -> user chooses us -> periscope re-sends
+ * FIFO_GET_PEER to us as {filename, accessModes, metadata, abilityName}, requestor = its
+ * relationship handle, which it expects back verbatim on our FIFO_RESPONSE. Our ability is
+ * only offered to a request whose minimal access mode contains "w" and whose metadata lists
+ * "pdf" (Ability::isRequestCompatible).
  */
 
 static void advertise_fifo_ability() {
@@ -1293,12 +1318,17 @@ static void advertise_fifo_ability() {
 	hipe_send(session, HIPE_OP_FIFO_ADD_ABILITY, 0, 0, 3,
 		FIFO_HOST_ABILITY, "w",
 		"Open a PDF document in the viewer\npdf:Portable Document Format");
+	DBG("advertised FIFO ability \"%s\" (mode w, pdf)\n", FIFO_HOST_ABILITY);
 }
 
 static void handle_incoming_fifo_get_peer(const hipe_instruction& ev) {
 	uint64_t requestor = ev.requestor; /* echo verbatim in our FIFO_RESPONSE */
 	const char* suggested = ev.arg[0]; /* suggested name, no extension; may be blank */
 	std::string display_name = (suggested && suggested[0]) ? suggested : "document";
+
+	DBG("incoming FIFO_GET_PEER: requestor=%llu name='%s' modes='%s' ability='%s'\n",
+		(unsigned long long) requestor, suggested ? suggested : "",
+		ev.arg[1] ? ev.arg[1] : "", ev.arg[3] ? ev.arg[3] : "");
 
 	/* Create the pipe we hand back. $XDG_RUNTIME_DIR is the right home for a transient
 	 * per-user IPC object; fall back to /tmp. */
@@ -1318,19 +1348,19 @@ static void handle_incoming_fifo_get_peer(const hipe_instruction& ev) {
 		return;
 	}
 	host_fifo_path = path;
+	DBG("created pipe %s; sending FIFO_RESPONSE\n", path);
 
 	/* Grant "w" (a subset of what the client asked for): it writes, we read. */
 	hipe_send(session, HIPE_OP_FIFO_RESPONSE, requestor, 0, 4,
 		path, "w", display_name.c_str(), "pdf:Portable Document Format");
 
-	/* The client signals readiness with FIFO_OPEN. The reader (us) must open first, so we
-	 * open on receipt and echo FIFO_OPEN back. Same blocking caveat as read_fifo_resource(). */
-	hipe_instruction open_instr;
-	hipe_instruction_init(&open_instr);
-	hipe_await_instruction(session, &open_instr, HIPE_OP_FIFO_OPEN);
-	std::string client_mode = (open_instr.arg[1] && open_instr.arg[1][0]) ? open_instr.arg[1] : "w";
-	hipe_instruction_clear(&open_instr);
-
+	/* Open our (read) end right away, before the client can act -- it only learns the path
+	 * from the response we just sent, so we are certain to be reading before it writes.
+	 * This means we do NOT block waiting for the client's FIFO_OPEN: drain_fifo()'s poll
+	 * loop waits for the writer and is capped at 30s, so a file shell that never follows
+	 * through leaves a bounded, visible failure rather than hanging the app. We still send
+	 * our own FIFO_OPEN so a client that waits for the host echo can proceed; the client's
+	 * own FIFO_OPEN, if it sends one, lands in the main loop and is ignored. */
 	int fd = open(path, O_RDONLY | O_NONBLOCK);
 	if (fd < 0) {
 		fprintf(stderr, "fifo host: open('%s'): %s\n", path, strerror(errno));
@@ -1338,10 +1368,12 @@ static void handle_incoming_fifo_get_peer(const hipe_instruction& ev) {
 		host_fifo_path.clear();
 		return;
 	}
-	hipe_send(session, HIPE_OP_FIFO_OPEN, 0, 0, 2, path, client_mode.c_str()); /* echo: our read end is open */
+	hipe_send(session, HIPE_OP_FIFO_OPEN, 0, 0, 2, path, "w"); /* our read end is open */
+	DBG("read end open, echoed FIFO_OPEN; draining pipe (30s cap)\n");
 
 	std::vector<uint8_t> bytes = drain_fifo(fd, "fifo host");
 	close(fd);
+	DBG("drained %zu bytes\n", bytes.size());
 
 	hipe_send(session, HIPE_OP_FIFO_CLOSE, 0, 0, 1, path);
 	hipe_send(session, HIPE_OP_FIFO_DROP_PEER, 0, 0, 1, path);
@@ -1943,11 +1975,17 @@ int main(int argc, char** argv) {
 			continue;
 		}
 
-		/* Teardown or a stray handshake echo that lands after a synchronous FIFO exchange
-		 * (host or client) already finished. Clean up any pipe still on disk; otherwise
-		 * nothing to do. */
-		if (event.opcode == HIPE_OP_FIFO_CLOSE || event.opcode == HIPE_OP_FIFO_DROP_PEER
-				|| event.opcode == HIPE_OP_FIFO_OPEN) {
+		/* Leftover handshake traffic that lands after a synchronous FIFO exchange (host or
+		 * client) already ran to completion -- the client's own FIFO_OPEN/CLOSE, or a
+		 * DROP_PEER. handle_incoming_fifo_get_peer() drains and unlinks its pipe itself, so
+		 * these are normally no-ops; DROP_PEER is honoured as a backstop for a pipe still on
+		 * disk (e.g. our handler returned early). Never unlink on FIFO_OPEN -- that can
+		 * arrive mid-transfer. */
+		if (event.opcode == HIPE_OP_FIFO_OPEN || event.opcode == HIPE_OP_FIFO_CLOSE) {
+			DBG("ignoring stray %s\n", event.opcode == HIPE_OP_FIFO_OPEN ? "FIFO_OPEN" : "FIFO_CLOSE");
+			continue;
+		}
+		if (event.opcode == HIPE_OP_FIFO_DROP_PEER) {
 			if (!host_fifo_path.empty() && event.arg[0] && host_fifo_path == event.arg[0]) {
 				unlink(host_fifo_path.c_str());
 				host_fifo_path.clear();
@@ -1955,7 +1993,11 @@ int main(int argc, char** argv) {
 			continue;
 		}
 
-		if (event.opcode != HIPE_OP_EVENT) continue;
+		if (event.opcode != HIPE_OP_EVENT) {
+			if (event.opcode != HIPE_OP_FRAME_CLOSE)
+				DBG("unhandled instruction opcode=%d\n", (int) event.opcode);
+			continue;
+		}
 		/* requestor is only meaningful on HIPE_OP_EVENT replies to our own
 		 * EVENT_REQUESTs -- other instruction types can carry unrelated
 		 * requestor values that happen to collide with our REQ_* codes. */
