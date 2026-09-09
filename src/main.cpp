@@ -131,6 +131,9 @@ static hipe_loc open_btn;       /* "Open" toolbar button -- only created when la
  * transfer, or empty. Tracked so a late/stray FIFO_CLOSE/FIFO_DROP_PEER and process exit
  * can unlink it. */
 static std::string host_fifo_path;
+/* Set when a FRAME_CLOSE or dropped server connection is seen from inside a blocking helper
+ * (drain_fifo) rather than the main loop -- the loop checks it and exits. */
+static bool g_should_exit = false;
 static hipe_loc slideshow_controls; /* wraps slideshow_menu_btn + slideshow_leave_btn -- see enter_slideshow */
 static hipe_loc slideshow_menu_btn;
 static hipe_loc slideshow_leave_btn;
@@ -1184,35 +1187,68 @@ static void request_open_document() {
 
 /* Reads a non-blocking fd to EOF into a buffer, polling so a stalled peer can't hang us
  * forever (30s cap). Shared by both FIFO roles -- the client reader (read_fifo_resource)
- * and the host reader (handle_incoming_fifo_get_peer). `who` just labels log messages. */
-static std::vector<uint8_t> drain_fifo(int fd, const char* who) {
+ * and the host reader (handle_incoming_fifo_get_peer). `who` just labels log messages.
+ *
+ * End of transfer is either a real pipe EOF (peer closed its write fd) OR a FIFO_CLOSE /
+ * FIFO_DROP_PEER instruction from the peer for `fifo_path`. The file shell's exporter keeps
+ * its write fd open and signals completion with the instruction rather than an EOF (see
+ * ~/export/export.cpp), so a pure pipe-poll loop would stall here until the 30s cap -- hence
+ * the hipe socket is also pumped, non-blocking, each iteration. A FRAME_CLOSE or lost server
+ * connection mid-transfer sets g_should_exit and ends the drain; any other instruction that
+ * lands during the transfer window is dropped (logged under HIPE_PDF_DEBUG). */
+static std::vector<uint8_t> drain_fifo(int fd, const char* fifo_path, const char* who) {
 	std::vector<uint8_t> bytes;
 	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
 	uint8_t chunk[64 * 1024];
-	bool done = false;
-	while (!done) {
+	bool eof = false, peer_closed = false;
+	hipe_instruction tmp;
+	hipe_instruction_init(&tmp);
+
+	while (!eof && !peer_closed) {
 		struct pollfd pfd = { fd, POLLIN, 0 };
-		int pr = poll(&pfd, 1, 1000);
-		if (pr < 0) {
-			if (errno == EINTR) continue;
+		int pr = poll(&pfd, 1, 200);
+		if (pr < 0 && errno != EINTR) {
 			fprintf(stderr, "%s: poll: %s\n", who, strerror(errno));
 			break;
 		}
 		if (pr > 0 && (pfd.revents & (POLLIN | POLLHUP))) {
-			ssize_t n = read(fd, chunk, sizeof(chunk));
-			if (n > 0) {
+			ssize_t n;
+			while ((n = read(fd, chunk, sizeof(chunk))) > 0)
 				bytes.insert(bytes.end(), chunk, chunk + n);
-			} else if (n == 0) {
-				done = true; /* writer closed -> end of transfer */
-			} else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+			if (n == 0) eof = true;
+			else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
 				fprintf(stderr, "%s: read: %s\n", who, strerror(errno));
 				break;
 			}
 		}
-		if (!done && std::chrono::steady_clock::now() > deadline) {
+		short got;
+		while (!peer_closed && (got = hipe_next_instruction(session, &tmp, 0)) != 0) {
+			if (got < 0) { g_should_exit = true; peer_closed = true; break; }
+			bool close_sig = (tmp.opcode == HIPE_OP_FIFO_CLOSE || tmp.opcode == HIPE_OP_FIFO_DROP_PEER)
+				&& tmp.arg[0] && fifo_path && strcmp(tmp.arg[0], fifo_path) == 0;
+			if (close_sig) {
+				peer_closed = true;
+			} else if (tmp.opcode == HIPE_OP_FRAME_CLOSE) {
+				g_should_exit = true;
+				peer_closed = true;
+			} else {
+				DBG("%s: dropped instruction opcode=%d during transfer\n", who, (int) tmp.opcode);
+			}
+		}
+		if (!eof && !peer_closed && std::chrono::steady_clock::now() > deadline) {
 			fprintf(stderr, "%s: timed out after 30s (%zu bytes so far)\n", who, bytes.size());
 			break;
 		}
+	}
+	hipe_instruction_clear(&tmp);
+
+	/* On a FIFO_CLOSE signal the last bytes are already in the pipe buffer (the peer wrote
+	 * everything before sending it, and the instruction crosses the relay slower than the
+	 * bytes cross the kernel) -- sweep whatever is readable now. */
+	if (peer_closed && !g_should_exit) {
+		ssize_t n;
+		while ((n = read(fd, chunk, sizeof(chunk))) > 0)
+			bytes.insert(bytes.end(), chunk, chunk + n);
 	}
 	return bytes;
 }
@@ -1247,7 +1283,7 @@ static std::vector<uint8_t> read_fifo_resource(const char* fifo_path) {
 	hipe_instruction_clear(&ack);
 	DBG("client: got host FIFO_OPEN echo, draining\n");
 
-	std::vector<uint8_t> bytes = drain_fifo(fd, "read_fifo_resource");
+	std::vector<uint8_t> bytes = drain_fifo(fd, fifo_path, "read_fifo_resource");
 	close(fd);
 	DBG("client: drained %zu bytes\n", bytes.size());
 
@@ -1371,7 +1407,7 @@ static void handle_incoming_fifo_get_peer(const hipe_instruction& ev) {
 	hipe_send(session, HIPE_OP_FIFO_OPEN, 0, 0, 2, path, "w"); /* our read end is open */
 	DBG("read end open, echoed FIFO_OPEN; draining pipe (30s cap)\n");
 
-	std::vector<uint8_t> bytes = drain_fifo(fd, "fifo host");
+	std::vector<uint8_t> bytes = drain_fifo(fd, path, "fifo host");
 	close(fd);
 	DBG("drained %zu bytes\n", bytes.size());
 
@@ -1964,6 +2000,7 @@ int main(int argc, char** argv) {
 		 * than in the HIPE_OP_EVENT dispatch below. */
 		if (event.opcode == HIPE_OP_FIFO_RESPONSE) {
 			if (event.requestor == REQ_FIFO_GET_PDF) handle_fifo_response(event);
+			if (g_should_exit) break;
 			continue;
 		}
 
@@ -1972,6 +2009,7 @@ int main(int argc, char** argv) {
 		 * where it was never advertised. */
 		if (event.opcode == HIPE_OP_FIFO_GET_PEER) {
 			if (!embedded_mode) handle_incoming_fifo_get_peer(event);
+			if (g_should_exit) break;
 			continue;
 		}
 
