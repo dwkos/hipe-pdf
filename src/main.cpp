@@ -48,6 +48,12 @@
  * can never collide regardless of document length -- see update_link_layer/dispatch. */
 #define REQ_LINK_BASE 100000
 
+/* Name of the FIFO ability this app advertises to the framing manager (HIPE_OP_FIFO_ADD_ABILITY)
+ * so another app -- e.g. a file shell doing "open with..." -- can push a PDF to it. Shown to
+ * the user by the framing manager when picking a target; identifies the ability within Hipe
+ * together with our client id. Not advertised in embedded mode. */
+#define FIFO_HOST_ABILITY "Open"
+
 /* DOM KeyboardEvent.keyCode values (legacy, but what this WebKit fork's
  * keydown detail string actually carries -- see requestEvent() in
  * hipecore's qwebelement.cpp). */
@@ -121,6 +127,10 @@ static hipe_loc navbar;
 static hipe_loc main_area;
 static hipe_loc empty_state;   /* "No document open" panel shown when launched with no file */
 static hipe_loc open_btn;       /* "Open" toolbar button -- only created when launched with no file */
+/* Path of the named pipe we (as FIFO host) created for an in-progress "open with..."
+ * transfer, or empty. Tracked so a late/stray FIFO_CLOSE/FIFO_DROP_PEER and process exit
+ * can unlink it. */
+static std::string host_fifo_path;
 static hipe_loc slideshow_controls; /* wraps slideshow_menu_btn + slideshow_leave_btn -- see enter_slideshow */
 static hipe_loc slideshow_menu_btn;
 static hipe_loc slideshow_leave_btn;
@@ -1159,38 +1169,11 @@ static void request_open_document() {
 		"Open PDF document\npdf:Portable Document Format");
 }
 
-/* Reads a whole FIFO resource (named pipe) into memory, running the reader side of the
- * HIPE_OP_FIFO_OPEN handshake. Returns the bytes, or an empty vector on any failure.
- *
- * Synchronous, like the other request/response exchanges in this file (get_geometry() etc.):
- * a slow mediated transfer blocks the client the same way a slow page render already does.
- * Known gap: the FIFO_OPEN echo below depends on the framing manager relaying the
- * instruction in both directions. A manager that answers FIFO_GET_PEER but never relays the
- * open handshake would leave hipe_await_instruction() blocked here. periscope -- the only
- * framing manager this runs under, and where the matching host side will live -- is expected
- * to implement it; if that proves fragile this should move into the main loop as a small
- * state machine. */
-static std::vector<uint8_t> read_fifo_resource(const char* fifo_path) {
+/* Reads a non-blocking fd to EOF into a buffer, polling so a stalled peer can't hang us
+ * forever (30s cap). Shared by both FIFO roles -- the client reader (read_fifo_resource)
+ * and the host reader (handle_incoming_fifo_get_peer). `who` just labels log messages. */
+static std::vector<uint8_t> drain_fifo(int fd, const char* who) {
 	std::vector<uint8_t> bytes;
-
-	/* Reader opens first, non-blocking so open() succeeds even though no writer has
-	 * attached yet (a blocking open would deadlock: the host only opens its write end in
-	 * response to the FIFO_OPEN we send just below). */
-	int fd = open(fifo_path, O_RDONLY | O_NONBLOCK);
-	if (fd < 0) {
-		fprintf(stderr, "read_fifo_resource: open('%s'): %s\n", fifo_path, strerror(errno));
-		return bytes;
-	}
-
-	hipe_send(session, HIPE_OP_FIFO_OPEN, 0, 0, 2, fifo_path, "r");
-
-	hipe_instruction ack;
-	hipe_instruction_init(&ack);
-	hipe_await_instruction(session, &ack, HIPE_OP_FIFO_OPEN); /* host's "my write end is open" echo */
-	hipe_instruction_clear(&ack);
-
-	/* Safety cap so a host that opens its end but never writes or closes can't hang us
-	 * indefinitely. Generous -- a large PDF over a slow mediated pipe is legitimate. */
 	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
 	uint8_t chunk[64 * 1024];
 	bool done = false;
@@ -1199,7 +1182,7 @@ static std::vector<uint8_t> read_fifo_resource(const char* fifo_path) {
 		int pr = poll(&pfd, 1, 1000);
 		if (pr < 0) {
 			if (errno == EINTR) continue;
-			fprintf(stderr, "read_fifo_resource: poll: %s\n", strerror(errno));
+			fprintf(stderr, "%s: poll: %s\n", who, strerror(errno));
 			break;
 		}
 		if (pr > 0 && (pfd.revents & (POLLIN | POLLHUP))) {
@@ -1209,17 +1192,49 @@ static std::vector<uint8_t> read_fifo_resource(const char* fifo_path) {
 			} else if (n == 0) {
 				done = true; /* writer closed -> end of transfer */
 			} else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-				fprintf(stderr, "read_fifo_resource: read: %s\n", strerror(errno));
+				fprintf(stderr, "%s: read: %s\n", who, strerror(errno));
 				break;
 			}
 		}
 		if (!done && std::chrono::steady_clock::now() > deadline) {
-			fprintf(stderr, "read_fifo_resource: timed out after 30s (%zu bytes so far)\n", bytes.size());
+			fprintf(stderr, "%s: timed out after 30s (%zu bytes so far)\n", who, bytes.size());
 			break;
 		}
 	}
+	return bytes;
+}
 
+/* Reads a whole FIFO resource (named pipe) into memory as the FIFO *client*, running the
+ * client side of the HIPE_OP_FIFO_OPEN handshake. Returns the bytes, or an empty vector on
+ * any failure.
+ *
+ * Synchronous, like the other request/response exchanges in this file (get_geometry() etc.):
+ * a slow mediated transfer blocks the client the same way a slow page render already does.
+ * Known gap: the FIFO_OPEN echo below depends on the framing manager relaying the
+ * instruction in both directions. A manager that answers FIFO_GET_PEER but never relays the
+ * open handshake would leave hipe_await_instruction() blocked here. periscope -- the only
+ * framing manager this runs under -- is expected to implement it; if that proves fragile
+ * this should move into the main loop as a small state machine. */
+static std::vector<uint8_t> read_fifo_resource(const char* fifo_path) {
+	/* Reader opens first, non-blocking so open() succeeds even though no writer has
+	 * attached yet (a blocking open would deadlock: the host only opens its write end in
+	 * response to the FIFO_OPEN we send just below). */
+	int fd = open(fifo_path, O_RDONLY | O_NONBLOCK);
+	if (fd < 0) {
+		fprintf(stderr, "read_fifo_resource: open('%s'): %s\n", fifo_path, strerror(errno));
+		return {};
+	}
+
+	hipe_send(session, HIPE_OP_FIFO_OPEN, 0, 0, 2, fifo_path, "r");
+
+	hipe_instruction ack;
+	hipe_instruction_init(&ack);
+	hipe_await_instruction(session, &ack, HIPE_OP_FIFO_OPEN); /* host's "my write end is open" echo */
+	hipe_instruction_clear(&ack);
+
+	std::vector<uint8_t> bytes = drain_fifo(fd, "read_fifo_resource");
 	close(fd);
+
 	/* Tell the host we're done: close this transfer, then drop the peer entirely (a viewer
 	 * only ever reads the file once -- there's no save-back). */
 	hipe_send(session, HIPE_OP_FIFO_CLOSE, 0, 0, 1, fifo_path);
@@ -1257,6 +1272,91 @@ static void handle_fifo_response(const hipe_instruction& ev) {
 		}
 	} catch (const std::exception& e) {
 		fprintf(stderr, "open: failed to load '%s': %s\n", path, e.what());
+		if (!doc) show_empty_state();
+	}
+}
+
+/* ---- FIFO host role: another app pushes a document to us ("open with...") ---------------
+ *
+ * At startup (non-embedded only) advertise_fifo_ability() tells the framing manager we can
+ * receive a PDF (HIPE_OP_FIFO_ADD_ABILITY). When a file shell then does "open with...", the
+ * framing manager relays its HIPE_OP_FIFO_GET_PEER to us with the chosen ability name in
+ * arg[3]; handle_incoming_fifo_get_peer() creates a pipe, answers with HIPE_OP_FIFO_RESPONSE,
+ * runs the reader side of the OPEN handshake, drains the bytes the shell writes, and loads
+ * them -- the same accept_document() path the Open button uses.
+ */
+
+static void advertise_fifo_ability() {
+	/* arg1 "w": the peer (the file shell) writes the document to us; we read it. arg2 is
+	 * newline-separated: description line, then "ext:label" file-type patterns the framing
+	 * manager matches senders against. */
+	hipe_send(session, HIPE_OP_FIFO_ADD_ABILITY, 0, 0, 3,
+		FIFO_HOST_ABILITY, "w",
+		"Open a PDF document in the viewer\npdf:Portable Document Format");
+}
+
+static void handle_incoming_fifo_get_peer(const hipe_instruction& ev) {
+	uint64_t requestor = ev.requestor; /* echo verbatim in our FIFO_RESPONSE */
+	const char* suggested = ev.arg[0]; /* suggested name, no extension; may be blank */
+	std::string display_name = (suggested && suggested[0]) ? suggested : "document";
+
+	/* Create the pipe we hand back. $XDG_RUNTIME_DIR is the right home for a transient
+	 * per-user IPC object; fall back to /tmp. */
+	const char* dir = getenv("XDG_RUNTIME_DIR");
+	if (!dir || !dir[0]) dir = "/tmp";
+	static unsigned seq = 0;
+	char path[256];
+	bool made = false;
+	for (int attempt = 0; attempt < 1000; attempt++, seq++) {
+		snprintf(path, sizeof(path), "%s/hipe-pdf-%ld-%u.pdf", dir, (long) getpid(), seq);
+		if (mkfifo(path, 0600) == 0) { made = true; break; }
+		if (errno != EEXIST) break;
+	}
+	if (!made) {
+		fprintf(stderr, "fifo host: mkfifo in '%s': %s\n", dir, strerror(errno));
+		hipe_send(session, HIPE_OP_FIFO_RESPONSE, requestor, 0, 1, ""); /* blank arg0 == reject */
+		return;
+	}
+	host_fifo_path = path;
+
+	/* Grant "w" (a subset of what the client asked for): it writes, we read. */
+	hipe_send(session, HIPE_OP_FIFO_RESPONSE, requestor, 0, 4,
+		path, "w", display_name.c_str(), "pdf:Portable Document Format");
+
+	/* The client signals readiness with FIFO_OPEN. The reader (us) must open first, so we
+	 * open on receipt and echo FIFO_OPEN back. Same blocking caveat as read_fifo_resource(). */
+	hipe_instruction open_instr;
+	hipe_instruction_init(&open_instr);
+	hipe_await_instruction(session, &open_instr, HIPE_OP_FIFO_OPEN);
+	std::string client_mode = (open_instr.arg[1] && open_instr.arg[1][0]) ? open_instr.arg[1] : "w";
+	hipe_instruction_clear(&open_instr);
+
+	int fd = open(path, O_RDONLY | O_NONBLOCK);
+	if (fd < 0) {
+		fprintf(stderr, "fifo host: open('%s'): %s\n", path, strerror(errno));
+		unlink(path);
+		host_fifo_path.clear();
+		return;
+	}
+	hipe_send(session, HIPE_OP_FIFO_OPEN, 0, 0, 2, path, client_mode.c_str()); /* echo: our read end is open */
+
+	std::vector<uint8_t> bytes = drain_fifo(fd, "fifo host");
+	close(fd);
+
+	hipe_send(session, HIPE_OP_FIFO_CLOSE, 0, 0, 1, path);
+	hipe_send(session, HIPE_OP_FIFO_DROP_PEER, 0, 0, 1, path);
+	unlink(path);
+	host_fifo_path.clear();
+
+	if (bytes.empty()) {
+		fprintf(stderr, "fifo host: no data received for '%s'\n", display_name.c_str());
+		if (!doc) show_empty_state();
+		return;
+	}
+	try {
+		accept_document(std::make_unique<PdfDocument>(bytes, ".pdf"), display_name);
+	} catch (const std::exception& e) {
+		fprintf(stderr, "fifo host: failed to load received document: %s\n", e.what());
 		if (!doc) show_empty_state();
 	}
 }
@@ -1791,8 +1891,10 @@ int main(int argc, char** argv) {
 		 * swap_in_document() does the initial content-area sizing + first render itself. */
 		swap_in_document(std::move(startup_doc), startup_path);
 	} else {
-		/* No-file mode: wait for the user to pick something via the Open button. */
+		/* No-file mode: wait for the user to pick something via the Open button, or for
+		 * another app to push a document to us. */
 		show_empty_state();
+		advertise_fifo_ability();
 	}
 
 	hipe_instruction event;
@@ -1830,6 +1932,26 @@ int main(int argc, char** argv) {
 		 * than in the HIPE_OP_EVENT dispatch below. */
 		if (event.opcode == HIPE_OP_FIFO_RESPONSE) {
 			if (event.requestor == REQ_FIFO_GET_PDF) handle_fifo_response(event);
+			continue;
+		}
+
+		/* Another app asking to hand us a document ("open with...") -- the FIFO host role,
+		 * matching the "Open" ability we advertised at startup. Ignored in embedded mode,
+		 * where it was never advertised. */
+		if (event.opcode == HIPE_OP_FIFO_GET_PEER) {
+			if (!embedded_mode) handle_incoming_fifo_get_peer(event);
+			continue;
+		}
+
+		/* Teardown or a stray handshake echo that lands after a synchronous FIFO exchange
+		 * (host or client) already finished. Clean up any pipe still on disk; otherwise
+		 * nothing to do. */
+		if (event.opcode == HIPE_OP_FIFO_CLOSE || event.opcode == HIPE_OP_FIFO_DROP_PEER
+				|| event.opcode == HIPE_OP_FIFO_OPEN) {
+			if (!host_fifo_path.empty() && event.arg[0] && host_fifo_path == event.arg[0]) {
+				unlink(host_fifo_path.c_str());
+				host_fifo_path.clear();
+			}
 			continue;
 		}
 
@@ -1882,6 +2004,11 @@ int main(int argc, char** argv) {
 		}
 		else if (event.requestor >= REQ_THUMB_BASE) render_and_show((int) (event.requestor - REQ_THUMB_BASE));
 	} while (event.opcode != HIPE_OP_FRAME_CLOSE);
+
+	if (!embedded_mode)
+		hipe_send(session, HIPE_OP_FIFO_REMOVE_ABILITY, 0, 0, 1, FIFO_HOST_ABILITY);
+	if (!host_fifo_path.empty())
+		unlink(host_fifo_path.c_str());
 
 	hipe_close_session(session);
 	return 0;
