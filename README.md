@@ -25,16 +25,20 @@ process. On a memory-constrained machine, build MuPDF with fewer jobs:
 cd third_party/mupdf && make build=release libs -j2   # or -j1
 ```
 
-The MuPDF objects and archives are toolchain- and architecture-specific and do **not** carry
-between machines. When moving the tree to another system, discard the old MuPDF build first:
+All build output -- both `build/*.o`/`build/hipe-pdf` and the MuPDF objects/archives -- is
+toolchain- and architecture-specific and does **not** carry between machines. If you copied the
+tree from another box rather than cloning it, start by discarding all of it:
 
 ```sh
-make clean-third-party   # rm -rf third_party/mupdf/build (leaves MuPDF source intact)
+make distclean     # clean + clean-third-party (rm -rf build/*.o build/hipe-pdf third_party/mupdf/build)
 make third-party
 make
 ```
 
-`make distclean` does `clean` + `clean-third-party` in one go.
+(`make clean-third-party` alone just wipes `third_party/mupdf/build`; `distclean` also clears
+the top-level `build/`. Both leave the checked-out MuPDF source intact.) Symptoms of stale
+cross-arch artifacts: `ld` reporting `skipping incompatible .../libmupdf.a` and then falling
+back to a system `libmupdf` with `undefined reference to fz_*` / `FT_*`.
 
 The resulting `build/hipe-pdf` statically links MuPDF and libhipe; only libc/libm/libstdc++
 remain dynamic (verify with `ldd build/hipe-pdf`).
