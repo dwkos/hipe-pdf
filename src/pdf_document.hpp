@@ -14,6 +14,13 @@ public:
 	explicit PdfDocument(const std::string& path);
 	/* Throws std::runtime_error if the file can't be opened or parsed. */
 
+	PdfDocument(const std::vector<uint8_t>& bytes, const std::string& magic);
+	/* Opens a document from an in-memory copy of its bytes rather than a path on disk --
+	 * used when the file arrives streamed through a Hipe FIFO resource (see
+	 * read_fifo_resource in main.cpp) instead of as an openable filesystem path. magic is
+	 * a filename or extension (e.g. ".pdf") used only for format detection. Throws
+	 * std::runtime_error if the bytes can't be parsed. */
+
 	~PdfDocument();
 
 	PdfDocument(const PdfDocument&) = delete;
@@ -69,6 +76,10 @@ public:
 	 * points, scaled by the caller the same way. Throws std::runtime_error on failure. */
 
 private:
+	void initContext();
+	/* Shared first half of both constructors: creates the fz_context and registers the
+	 * document handlers. Throws std::runtime_error if the context can't be created. */
+
 	fz_context* ctx;
 	fz_document* doc;
 };

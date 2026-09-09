@@ -3,6 +3,7 @@
 #include "icon_data.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -12,6 +13,11 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <fcntl.h>
+#include <poll.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #define REQ_PREV 1
 #define REQ_NEXT 2
@@ -30,6 +36,13 @@
 #define REQ_ZOOM_RESET 15
 #define REQ_SIDEBAR_TOGGLE 16
 #define REQ_SLIDESHOW_MOUSEMOVE 17
+#define REQ_OPEN 18         /* "Open" toolbar button / empty-state panel click */
+/* The requestor value passed with our HIPE_OP_FIFO_GET_PEER request; the server (top level)
+ * or framing manager echoes it back on the HIPE_OP_FIFO_RESPONSE so we can recognise it.
+ * Distinct from every other REQ_* -- though the dispatch only trusts it after checking
+ * opcode == HIPE_OP_FIFO_RESPONSE, since an unrelated instruction could carry any requestor
+ * (see the loop's own note about requestor collisions). */
+#define REQ_FIFO_GET_PDF 19
 #define REQ_THUMB_BASE 1000
 /* Far above REQ_THUMB_BASE's own range (REQ_THUMB_BASE + page_count) so the two ranges
  * can never collide regardless of document length -- see update_link_layer/dispatch. */
@@ -106,6 +119,8 @@ static hipe_loc viewport;
 static hipe_loc sidebar;
 static hipe_loc navbar;
 static hipe_loc main_area;
+static hipe_loc empty_state;   /* "No document open" panel shown when launched with no file */
+static hipe_loc open_btn;       /* "Open" toolbar button -- only created when launched with no file */
 static hipe_loc slideshow_controls; /* wraps slideshow_menu_btn + slideshow_leave_btn -- see enter_slideshow */
 static hipe_loc slideshow_menu_btn;
 static hipe_loc slideshow_leave_btn;
@@ -265,13 +280,17 @@ static float smart_starting_width(int page_number, float intended_width) {
 	return std::max(LOW_RES_FALLBACK_WIDTH_PX, std::min(intended_width, estimated));
 }
 
+/* Which thumbnail currently wears the highlight border. File-scope (not a function-local
+ * static) so swap_in_document() can reset it to -1 when a new document replaces the sidebar
+ * -- otherwise a stale index could clear the border on the wrong page's fresh thumbnail. */
+static int highlighted_thumb = -1;
+
 static void highlight_thumbnail(int page_number) {
-	static int previous = -1;
-	if (previous >= 0 && previous < (int) thumb_locs.size())
-		hipe_send(session, HIPE_OP_SET_STYLE, 0, thumb_locs[previous], 2, "border", "2px solid transparent");
+	if (highlighted_thumb >= 0 && highlighted_thumb < (int) thumb_locs.size())
+		hipe_send(session, HIPE_OP_SET_STYLE, 0, thumb_locs[highlighted_thumb], 2, "border", "2px solid transparent");
 	if (page_number >= 0 && page_number < (int) thumb_locs.size())
 		hipe_send(session, HIPE_OP_SET_STYLE, 0, thumb_locs[page_number], 2, "border", "2px solid #3388ff");
-	previous = page_number;
+	highlighted_thumb = page_number;
 }
 
 static void scroll_thumbnail_into_view(int page_number) {
@@ -1039,23 +1058,225 @@ static void build_thumbnail_sidebar(hipe_loc sidebar) {
 	}
 }
 
-int main(int argc, char** argv) {
-	if (argc < 2) {
-		fprintf(stderr, "Usage: %s <file.pdf>\n", argv[0]);
-		return 1;
+/* ---- Opening a document at runtime (see the "Open" toolbar button) ---------------------
+ *
+ * When launched with no file argument the app starts document-less, showing #emptyState and
+ * an "Open" button. The button asks the environment for a PDF through Hipe's FIFO framework
+ * (HIPE_OP_FIFO_GET_PEER): at top level Hipe answers with a native file dialog and hands back
+ * a real filesystem path; under a framing manager (periscope) the manager mediates a FIFO
+ * peer and hands back a named pipe to stream the bytes through. Either way the answer is a
+ * HIPE_OP_FIFO_RESPONSE processed in the main loop -> handle_fifo_response() below.
+ */
+
+static void show_empty_state() {
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, empty_state, 2, "display", "flex");
+}
+
+static void hide_empty_state() {
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, empty_state, 2, "display", "none");
+}
+
+/* Everything that has to happen when a freshly parsed document takes over the screen --
+ * whether from nothing (startup with a file arg) or replacing a document already open (a
+ * runtime Open). Tears down the previous document's sidebar and per-document caches first,
+ * so it's safe to call repeatedly. new_doc must have at least one page (checked by the
+ * caller). */
+static void swap_in_document(std::unique_ptr<PdfDocument> new_doc, const std::string& display_name) {
+	doc = std::move(new_doc);
+	page_count = doc->pageCount();
+	current_page = 0;
+
+	/* Back to defaults: carrying a previous document's zoom/fit state onto an unrelated new
+	 * one (with entirely different page dimensions) is more surprising than helpful. */
+	zoom_level = 1.0f;
+	fit_mode = FitMode::NONE;
+	current_page_has_raster = false;
+	current_page_is_low_res = false;
+	current_page_links.clear();
+
+	/* Drop the previous document's sidebar plus the per-document complexity table that
+	 * page_is_flagged_complex()/smart_starting_width() read from (those two vectors + the
+	 * median are the whole cache). highlighted_thumb is reset so a stale index can't clear
+	 * the border on one of the incoming thumbnails. */
+	hipe_send(session, HIPE_OP_CLEAR, 0, sidebar, 0);
+	thumb_locs.clear();
+	thumb_render_ms.clear();
+	thumb_render_ms_median = 0.0;
+	highlighted_thumb = -1;
+
+	hide_empty_state();
+
+	if (!display_name.empty()) {
+		std::string title = "hipe-pdf \xe2\x80\x94 " + display_name;
+		hipe_send(session, HIPE_OP_SET_TITLE, 0, 0, 1, title.c_str());
 	}
+
+	/* Same initial sizing main() uses: fill ~90% of the content area. */
+	float main_w = 0, main_h = 0;
+	get_geometry(main_area, &main_w, &main_h);
+	if (main_w > 100) base_render_width = main_w * 0.9f;
+	render_width = base_render_width * zoom_level;
+
+	build_thumbnail_sidebar(sidebar);
+	render_and_show(0);
+	update_zoom_label();
+}
+
+/* Validates a just-constructed document and either swaps it in or reports why it can't be.
+ * Used for runtime opens; startup keeps its own fail-fast path in main(). */
+static void accept_document(std::unique_ptr<PdfDocument> new_doc, const std::string& display_name) {
+	int pages = 0;
+	try {
+		pages = new_doc->pageCount();
+	} catch (const std::exception& e) {
+		fprintf(stderr, "open: %s\n", e.what());
+	}
+	if (pages <= 0) {
+		fprintf(stderr, "open: '%s' has no pages\n", display_name.c_str());
+		if (!doc) show_empty_state(); /* else leave the current document on screen */
+		return;
+	}
+	swap_in_document(std::move(new_doc), display_name);
+}
+
+static void request_open_document() {
+	/* arg0: suggested name without extension; arg1: minimal required access mode (read);
+	 * arg2: caption line then newline-separated "ext:description" type filters. We don't
+	 * block waiting for the reply here -- it comes back asynchronously as a
+	 * HIPE_OP_FIFO_RESPONSE (see the main loop) so the UI stays responsive while the file
+	 * dialog / peer picker is open. */
+	hipe_send(session, HIPE_OP_FIFO_GET_PEER, REQ_FIFO_GET_PDF, 0, 3,
+		"document", "r",
+		"Open PDF document\npdf:Portable Document Format");
+}
+
+/* Reads a whole FIFO resource (named pipe) into memory, running the reader side of the
+ * HIPE_OP_FIFO_OPEN handshake. Returns the bytes, or an empty vector on any failure.
+ *
+ * Synchronous, like the other request/response exchanges in this file (get_geometry() etc.):
+ * a slow mediated transfer blocks the client the same way a slow page render already does.
+ * Known gap: the FIFO_OPEN echo below depends on the framing manager relaying the
+ * instruction in both directions. A manager that answers FIFO_GET_PEER but never relays the
+ * open handshake would leave hipe_await_instruction() blocked here. periscope -- the only
+ * framing manager this runs under, and where the matching host side will live -- is expected
+ * to implement it; if that proves fragile this should move into the main loop as a small
+ * state machine. */
+static std::vector<uint8_t> read_fifo_resource(const char* fifo_path) {
+	std::vector<uint8_t> bytes;
+
+	/* Reader opens first, non-blocking so open() succeeds even though no writer has
+	 * attached yet (a blocking open would deadlock: the host only opens its write end in
+	 * response to the FIFO_OPEN we send just below). */
+	int fd = open(fifo_path, O_RDONLY | O_NONBLOCK);
+	if (fd < 0) {
+		fprintf(stderr, "read_fifo_resource: open('%s'): %s\n", fifo_path, strerror(errno));
+		return bytes;
+	}
+
+	hipe_send(session, HIPE_OP_FIFO_OPEN, 0, 0, 2, fifo_path, "r");
+
+	hipe_instruction ack;
+	hipe_instruction_init(&ack);
+	hipe_await_instruction(session, &ack, HIPE_OP_FIFO_OPEN); /* host's "my write end is open" echo */
+	hipe_instruction_clear(&ack);
+
+	/* Safety cap so a host that opens its end but never writes or closes can't hang us
+	 * indefinitely. Generous -- a large PDF over a slow mediated pipe is legitimate. */
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+	uint8_t chunk[64 * 1024];
+	bool done = false;
+	while (!done) {
+		struct pollfd pfd = { fd, POLLIN, 0 };
+		int pr = poll(&pfd, 1, 1000);
+		if (pr < 0) {
+			if (errno == EINTR) continue;
+			fprintf(stderr, "read_fifo_resource: poll: %s\n", strerror(errno));
+			break;
+		}
+		if (pr > 0 && (pfd.revents & (POLLIN | POLLHUP))) {
+			ssize_t n = read(fd, chunk, sizeof(chunk));
+			if (n > 0) {
+				bytes.insert(bytes.end(), chunk, chunk + n);
+			} else if (n == 0) {
+				done = true; /* writer closed -> end of transfer */
+			} else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+				fprintf(stderr, "read_fifo_resource: read: %s\n", strerror(errno));
+				break;
+			}
+		}
+		if (!done && std::chrono::steady_clock::now() > deadline) {
+			fprintf(stderr, "read_fifo_resource: timed out after 30s (%zu bytes so far)\n", bytes.size());
+			break;
+		}
+	}
+
+	close(fd);
+	/* Tell the host we're done: close this transfer, then drop the peer entirely (a viewer
+	 * only ever reads the file once -- there's no save-back). */
+	hipe_send(session, HIPE_OP_FIFO_CLOSE, 0, 0, 1, fifo_path);
+	hipe_send(session, HIPE_OP_FIFO_DROP_PEER, 0, 0, 1, fifo_path);
+	return bytes;
+}
+
+static void handle_fifo_response(const hipe_instruction& ev) {
+	const char* path = ev.arg[0];
+	if (!path || !path[0]) {
+		/* Blank arg[0] == the user cancelled the picker, or the host rejected the request.
+		 * Leave whatever is on screen (empty state, or the current document) as-is. */
+		return;
+	}
+
+	const char* name_arg = ev.arg[2]; /* host-assigned display filename; may be empty */
+	std::string display_name = (name_arg && name_arg[0]) ? name_arg : path;
+
+	/* A real file (top level: Hipe handed back an openable path) vs a FIFO (framed: a named
+	 * pipe to stream the bytes through). */
+	struct stat st;
+	bool is_fifo = (stat(path, &st) == 0 && S_ISFIFO(st.st_mode));
 
 	try {
-		doc = std::make_unique<PdfDocument>(argv[1]);
+		if (is_fifo) {
+			std::vector<uint8_t> data = read_fifo_resource(path);
+			if (data.empty()) {
+				fprintf(stderr, "open: no data received from FIFO '%s'\n", path);
+				if (!doc) show_empty_state();
+				return;
+			}
+			accept_document(std::make_unique<PdfDocument>(data, ".pdf"), display_name);
+		} else {
+			accept_document(std::make_unique<PdfDocument>(std::string(path)), display_name);
+		}
 	} catch (const std::exception& e) {
-		fprintf(stderr, "%s\n", e.what());
-		return 2;
+		fprintf(stderr, "open: failed to load '%s': %s\n", path, e.what());
+		if (!doc) show_empty_state();
 	}
+}
 
-	page_count = doc->pageCount();
-	if (page_count <= 0) {
-		fprintf(stderr, "No pages found in '%s'\n", argv[1]);
-		return 2;
+int main(int argc, char** argv) {
+	/* Two launch modes:
+	 *   - with a file argument: "embedded document" mode -- open that file, no Open button
+	 *     (like a PDF embedded in a web page).
+	 *   - with no argument: start document-less, show the empty-state panel and an Open
+	 *     button that pulls a file in through Hipe's FIFO framework (see
+	 *     request_open_document / handle_fifo_response). The button stays available
+	 *     afterwards for swapping documents in-session. */
+	const char* startup_path = (argc >= 2) ? argv[1] : nullptr;
+	bool embedded_mode = (startup_path != nullptr);
+
+	/* Embedded mode fails fast, before opening a session, exactly as before -- a bad file
+	 * passed explicitly is a launch error, not something to recover from with a picker. */
+	std::unique_ptr<PdfDocument> startup_doc;
+	if (startup_path) {
+		try {
+			startup_doc = std::make_unique<PdfDocument>(std::string(startup_path));
+		} catch (const std::exception& e) {
+			fprintf(stderr, "%s\n", e.what());
+			return 2;
+		}
+		if (startup_doc->pageCount() <= 0) {
+			fprintf(stderr, "No pages found in '%s'\n", startup_path);
+			return 2;
+		}
 	}
 
 	session = hipe_open_session(0, 0, 0, argv[0]);
@@ -1146,7 +1367,9 @@ int main(int argc, char** argv) {
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, sidebar, 2, "position", "relative");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, sidebar, 2, "z-index", "1");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, sidebar, 2, "flex-shrink", "0");
-	build_thumbnail_sidebar(sidebar);
+	/* The sidebar is populated by swap_in_document() once a document is loaded (which may
+	 * be now, in embedded mode, or later via the Open button) -- not here, where there is
+	 * no document yet. */
 
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, root, 2, "div", "main");
 	main_area = get_by_id("main");
@@ -1206,6 +1429,34 @@ int main(int argc, char** argv) {
 	bottom_spacer = get_by_id("bottomSpacer");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, bottom_spacer, 2, "width", "1px");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, bottom_spacer, 2, "height", "0px");
+
+	/* The "no document open" panel, shown only when the app is launched with no file (see
+	 * main()'s two launch modes). A child of #main_area (which is position:relative) rather
+	 * than #viewport, filling it absolutely, so it sits over the empty page area regardless
+	 * of #viewport's own scroll/centering state -- and below #navbar (z-index:10), so the
+	 * Open button stays clickable on top of it. The whole panel is a click target for
+	 * REQ_OPEN too, not just the toolbar button. Styled like #pageStatus (theme-inherited
+	 * fill/text, dashed outline) for consistency with the loading/error overlay. */
+	hipe_send(session, HIPE_OP_APPEND_TAG, 0, main_area, 2, "div", "emptyState");
+	empty_state = get_by_id("emptyState");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, empty_state, 2, "position", "absolute");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, empty_state, 2, "top", "0");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, empty_state, 2, "left", "0");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, empty_state, 2, "width", "100%");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, empty_state, 2, "height", "100%");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, empty_state, 2, "box-sizing", "border-box");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, empty_state, 2, "display", "none");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, empty_state, 2, "align-items", "center");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, empty_state, 2, "justify-content", "center");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, empty_state, 2, "text-align", "center");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, empty_state, 2, "white-space", "pre-line");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, empty_state, 2, "cursor", "pointer");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, empty_state, 2, "background-color", "inherit");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, empty_state, 2, "color", "inherit");
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, empty_state, 2, "font-size", "15px");
+	hipe_send(session, HIPE_OP_SET_TEXT, 0, empty_state, 1,
+		"No document open\n\n\xf0\x9f\x93\x82  Click here (or Open) to choose a PDF");
+	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_OPEN, empty_state, 1, "click");
 
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, page_wrapper, 2, "img", "page");
 	img_page = get_by_id("page");
@@ -1369,6 +1620,19 @@ int main(int argc, char** argv) {
 	const char* GROUP_MARGIN = "22px";  /* between page nav / zoom / slideshow */
 	const char* ITEM_MARGIN = "6px";    /* between controls within one group */
 
+	/* "Open" button -- only in the no-file launch mode (see main()'s two modes). First
+	 * child of #navbar, so it sits leftmost, ahead of the sidebar toggle. Not created at
+	 * all in embedded mode, matching how an embedded PDF viewer has no way to load a
+	 * different file. It's a child of #navbar so slideshow hides it automatically along
+	 * with the rest of the toolbar. */
+	if (!embedded_mode) {
+		hipe_send(session, HIPE_OP_APPEND_TAG, 0, navbar, 2, "button", "openBtn");
+		open_btn = get_by_id("openBtn");
+		hipe_send(session, HIPE_OP_APPEND_TEXT, 0, open_btn, 1, "\xf0\x9f\x93\x82 Open" /* 📂 Open */);
+		hipe_send(session, HIPE_OP_SET_STYLE, 0, open_btn, 2, "margin-right", GROUP_MARGIN);
+		hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_OPEN, open_btn, 1, "click");
+	}
+
 	/* Leftmost, ahead of the page-nav group -- now that sidebar and navbar read as one
 	 * L-shaped panel (see #viewport/#navbar above), a sidebar show/hide toggle belongs
 	 * with the rest of the chrome that panel represents rather than tucked away
@@ -1513,14 +1777,14 @@ int main(int argc, char** argv) {
 	 * arbitrary here -- 0 to match the other whole-frame requests above. */
 	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_RESIZE, 0, 1, "resize");
 
-	/* Size the initial render to roughly fill the main content area. */
-	float main_w = 0, main_h = 0;
-	get_geometry(main_area, &main_w, &main_h);
-	if (main_w > 100) base_render_width = main_w * 0.9f;
-	render_width = base_render_width * zoom_level;
-
-	render_and_show(0);
-	update_zoom_label();
+	if (startup_doc) {
+		/* Embedded mode: show the file that was passed on the command line.
+		 * swap_in_document() does the initial content-area sizing + first render itself. */
+		swap_in_document(std::move(startup_doc), startup_path);
+	} else {
+		/* No-file mode: wait for the user to pick something via the Open button. */
+		show_empty_state();
+	}
 
 	hipe_instruction event;
 	hipe_instruction_init(&event);
@@ -1552,11 +1816,25 @@ int main(int argc, char** argv) {
 			continue;
 		}
 
+		/* The environment's answer to a request_open_document() -- a real file path (top
+		 * level) or a FIFO path (framed). Handled here, like DIALOG_RETURN above, rather
+		 * than in the HIPE_OP_EVENT dispatch below. */
+		if (event.opcode == HIPE_OP_FIFO_RESPONSE) {
+			if (event.requestor == REQ_FIFO_GET_PDF) handle_fifo_response(event);
+			continue;
+		}
+
 		if (event.opcode != HIPE_OP_EVENT) continue;
 		/* requestor is only meaningful on HIPE_OP_EVENT replies to our own
 		 * EVENT_REQUESTs -- other instruction types can carry unrelated
 		 * requestor values that happen to collide with our REQ_* codes. */
-		if (event.requestor == REQ_SIDEBAR_TOGGLE) toggle_sidebar();
+		if (event.requestor == REQ_OPEN) request_open_document();
+		/* Every other action needs a loaded document. With none (the no-file launch mode,
+		 * before the first Open), the toolbar isn't shown and #emptyState only emits
+		 * REQ_OPEN -- but guard anyway so a stray event can't reach code that dereferences
+		 * doc. */
+		else if (!doc) { /* nothing */ }
+		else if (event.requestor == REQ_SIDEBAR_TOGGLE) toggle_sidebar();
 		else if (event.requestor == REQ_PREV) render_and_show(current_page - 1, true);
 		else if (event.requestor == REQ_NEXT) render_and_show(current_page + 1);
 		else if (event.requestor == REQ_ZOOM_OUT) set_zoom(zoom_level / ZOOM_STEP);

@@ -9,12 +9,16 @@
 #include <stdexcept>
 #include <thread>
 
-PdfDocument::PdfDocument(const std::string& path) : ctx(nullptr), doc(nullptr) {
+void PdfDocument::initContext() {
 	ctx = fz_new_context(nullptr, nullptr, FZ_STORE_DEFAULT);
 	if (!ctx)
 		throw std::runtime_error("could not create MuPDF context");
 
 	fz_register_document_handlers(ctx);
+}
+
+PdfDocument::PdfDocument(const std::string& path) : ctx(nullptr), doc(nullptr) {
+	initContext();
 
 	fz_try(ctx) {
 		doc = fz_open_document(ctx, path.c_str());
@@ -22,6 +26,30 @@ PdfDocument::PdfDocument(const std::string& path) : ctx(nullptr), doc(nullptr) {
 		std::string message = fz_caught_message(ctx);
 		fz_drop_context(ctx);
 		throw std::runtime_error("failed to open '" + path + "': " + message);
+	}
+}
+
+PdfDocument::PdfDocument(const std::vector<uint8_t>& bytes, const std::string& magic)
+	: ctx(nullptr), doc(nullptr) {
+	initContext();
+
+	/* fz_open_buffer (reached via fz_open_document_with_buffer) takes its own reference to
+	 * the buffer and the resulting document keeps the stream wrapping it alive, so our own
+	 * reference can be dropped as soon as the document is open -- the bytes stay valid for
+	 * the document's lifetime regardless. fz_new_buffer_from_copied_data copies, so the
+	 * caller's vector doesn't need to outlive this call. */
+	fz_buffer* buf = nullptr;
+	fz_var(buf);
+
+	fz_try(ctx) {
+		buf = fz_new_buffer_from_copied_data(ctx, bytes.data(), bytes.size());
+		doc = fz_open_document_with_buffer(ctx, magic.c_str(), buf);
+	} fz_always(ctx) {
+		fz_drop_buffer(ctx, buf);
+	} fz_catch(ctx) {
+		std::string message = fz_caught_message(ctx);
+		fz_drop_context(ctx);
+		throw std::runtime_error("failed to open in-memory document: " + message);
 	}
 }
 
