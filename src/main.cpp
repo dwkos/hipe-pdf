@@ -54,6 +54,16 @@
  * together with our client id. Not advertised in embedded mode. */
 #define FIFO_HOST_ABILITY "Open"
 
+/* Mouse cursors are applied as unicode characters via HIPE_OP_SET_CURSOR (the server
+ * rasterises the glyph to an SVG cursor in the frame's fg/bg colours), not as CSS `cursor:`
+ * keywords -- the native cursors those map to don't render on some embedded hosts. Matches
+ * periscope's convention (its default is U+1F87C). U+1F87C is a NW-pointing arrow whose tip
+ * sits at the server's fixed 0,7 hotspot; the busy cursor is a gear. */
+#define CURSOR_DEFAULT "\xf0\x9f\xa1\xbc" /* 🡼 U+1F87C -- NW arrow, matches server hotspot */
+#define CURSOR_POINTER "\xf0\x9f\x91\x86" /* 👆 U+1F446 -- over clickable chrome (buttons, links, thumbnails) */
+#define CURSOR_TEXT    "\xe2\x8c\xb6"     /* ⌶ U+2336 -- over the selectable text overlay */
+#define CURSOR_BUSY    "\xe2\x9a\x99"     /* ⚙ U+2699 -- during a slow page render */
+
 /* DOM KeyboardEvent.keyCode values (legacy, but what this WebKit fork's
  * keydown detail string actually carries -- see requestEvent() in
  * hipecore's qwebelement.cpp). */
@@ -458,9 +468,10 @@ static void update_link_layer(int page_number, float scale) {
 		hipe_send(session, HIPE_OP_APPEND_TAG, 0, link_layer, 1, "div");
 		hipe_loc loc = hipe_newest_location();
 
-		/* Common properties (position:absolute, cursor:pointer, etc.) come from the
-		 * "#linkLayer div" rule added once at startup; only per-link geometry and the
-		 * click registration need setting here. */
+		/* Common properties (position:absolute, pointer-events:auto, ...) come from the
+		 * "#linkLayer div" rule added once at startup, and the CURSOR_POINTER glyph is
+		 * inherited from #linkLayer (see main()); only per-link geometry and the click
+		 * registration need setting here. */
 		snprintf(buf, sizeof(buf), "%dpx", (int) (link.x * scale));
 		hipe_send(session, HIPE_OP_SET_STYLE, 0, loc, 2, "left", buf);
 		snprintf(buf, sizeof(buf), "%dpx", (int) (link.y * scale));
@@ -638,7 +649,7 @@ static void render_and_show(int page_number, bool land_at_bottom = false) {
 	}
 
 	is_busy = true;
-	hipe_send(session, HIPE_OP_SET_CURSOR, 0, 0, 1, "\xe2\x9a\x99" /* ⚙ */);
+	hipe_send(session, HIPE_OP_SET_CURSOR, 0, 0, 1, CURSOR_BUSY);
 	std::vector<uint8_t> png;
 	bool low_res_fallback = false;
 	/* A page whose own thumbnail render took far longer than the batch's median (see
@@ -669,7 +680,7 @@ static void render_and_show(int page_number, bool land_at_bottom = false) {
 			low_res_fallback = true;
 		} catch (const std::exception& e2) {
 			is_busy = false;
-			hipe_send(session, HIPE_OP_SET_CURSOR, 0, 0, 1, "");
+			hipe_send(session, HIPE_OP_SET_CURSOR, 0, 0, 1, CURSOR_DEFAULT);
 			fprintf(stderr, "Low-res fallback for page %d also failed: %s\n", current_page, e2.what());
 			char err_buf[128];
 			snprintf(err_buf, sizeof(err_buf),
@@ -701,7 +712,7 @@ static void render_and_show(int page_number, bool land_at_bottom = false) {
 	}
 	current_page_is_low_res = low_res_fallback;
 	is_busy = false;
-	hipe_send(session, HIPE_OP_SET_CURSOR, 0, 0, 1, "");
+	hipe_send(session, HIPE_OP_SET_CURSOR, 0, 0, 1, CURSOR_DEFAULT);
 	hide_page_status();
 
 	hipe_instruction instr;
@@ -1061,7 +1072,6 @@ static void build_thumbnail_sidebar(hipe_loc sidebar) {
 		hipe_send(session, HIPE_OP_SET_STYLE, 0, thumb, 2, "width", "110px");
 		hipe_send(session, HIPE_OP_SET_STYLE, 0, thumb, 2, "margin", "6px auto");
 		hipe_send(session, HIPE_OP_SET_STYLE, 0, thumb, 2, "border", "2px solid transparent");
-		hipe_send(session, HIPE_OP_SET_STYLE, 0, thumb, 2, "cursor", "pointer");
 		hipe_send(session, HIPE_OP_SET_STYLE, 0, thumb, 2, "box-shadow", "0 0 4px rgba(0,0,0,0.3)");
 
 		hipe_instruction instr;
@@ -1476,6 +1486,15 @@ int main(int argc, char** argv) {
 	 * page text instead of grabbing the whole GUI (buttons, labels, thumbnails, etc). */
 	hipe_send(session, HIPE_OP_ADD_STYLE_RULE, 0, 0, 2, "body",
 		"margin:0; font-family:sans-serif; -webkit-user-select:none; user-select:none;");
+	/* Cursors are unicode glyphs set with SET_CURSOR, never CSS `cursor:` keywords (see the
+	 * CURSOR_* defines). `cursor:inherit` on `*` stops <button> etc. from falling back to
+	 * their native cursor, so setting SET_CURSOR on a container is enough for all its
+	 * descendants (including ones appended later, e.g. link divs / text spans / thumbnails).
+	 * The body default is set here; navbar/sidebar/overlays override it below;
+	 * render_and_show() swaps to CURSOR_BUSY around a slow render. Same approach as
+	 * periscope's Screen. */
+	hipe_send(session, HIPE_OP_ADD_STYLE_RULE, 0, 0, 2, "*", "cursor:inherit;");
+	hipe_send(session, HIPE_OP_SET_CURSOR, 0, 0, 1, CURSOR_DEFAULT);
 	/* Shared text-overlay span properties; per-span geometry is set individually in
 	 * update_text_layer(). "style" isn't in the server's SET_ATTRIBUTE whitelist, so this
 	 * (rather than one combined inline style per span) is how the fixed parts are set.
@@ -1497,7 +1516,7 @@ int main(int argc, char** argv) {
 	 * hit-testable so drag-to-select still works (pointer-events is inherited, so without
 	 * this override every span would inherit the container's none too). */
 	hipe_send(session, HIPE_OP_ADD_STYLE_RULE, 0, 0, 2, "#textLayer span",
-		"position:absolute; color:transparent; white-space:nowrap; overflow:visible; cursor:text; "
+		"position:absolute; color:transparent; white-space:nowrap; overflow:visible; "
 		"pointer-events:auto; -webkit-user-select:text; user-select:text;");
 	/* Shared link-overlay div properties; per-link geometry is set individually in
 	 * update_link_layer(). user-select:none so a click-drag starting on a link doesn't
@@ -1505,7 +1524,7 @@ int main(int argc, char** argv) {
 	 * click. pointer-events:auto opts each individual link div back into hit-testing --
 	 * see #linkLayer's own pointer-events:none below for why that's needed at all. */
 	hipe_send(session, HIPE_OP_ADD_STYLE_RULE, 0, 0, 2, "#linkLayer div",
-		"position:absolute; cursor:pointer; pointer-events:auto; "
+		"position:absolute; pointer-events:auto; "
 		"-webkit-user-select:none; user-select:none;");
 
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, 0, 2, "div", "root");
@@ -1523,6 +1542,7 @@ int main(int argc, char** argv) {
 
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, root, 2, "div", "sidebar");
 	sidebar = get_by_id("sidebar");
+	hipe_send(session, HIPE_OP_SET_CURSOR, 0, sidebar, 1, CURSOR_POINTER); /* thumbnails inherit */
 	char sidebar_width_buf[16];
 	snprintf(sidebar_width_buf, sizeof(sidebar_width_buf), "%dpx", (int) SIDEBAR_WIDTH_PX);
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, sidebar, 2, "width", sidebar_width_buf);
@@ -1627,7 +1647,7 @@ int main(int argc, char** argv) {
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, empty_state, 2, "justify-content", "center");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, empty_state, 2, "text-align", "center");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, empty_state, 2, "white-space", "pre-line");
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, empty_state, 2, "cursor", "pointer");
+	hipe_send(session, HIPE_OP_SET_CURSOR, 0, empty_state, 1, CURSOR_POINTER); /* whole panel opens a file */
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, empty_state, 2, "background-color", "inherit");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, empty_state, 2, "color", "inherit");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, empty_state, 2, "font-size", "15px");
@@ -1691,6 +1711,7 @@ int main(int argc, char** argv) {
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, text_layer, 2, "width", "100%");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, text_layer, 2, "height", "100%");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, text_layer, 2, "overflow", "hidden");
+	hipe_send(session, HIPE_OP_SET_CURSOR, 0, text_layer, 1, CURSOR_TEXT); /* spans inherit the I-beam */
 	/* See the "#textLayer span" rule's comment above -- the container itself must not be
 	 * hit-testable, only the individual spans (which opt back in via their own
 	 * pointer-events:auto), or its blank areas swallow clicks meant for img_page below. */
@@ -1712,6 +1733,7 @@ int main(int argc, char** argv) {
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, link_layer, 2, "height", "100%");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, link_layer, 2, "overflow", "hidden");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, link_layer, 2, "z-index", "1");
+	hipe_send(session, HIPE_OP_SET_CURSOR, 0, link_layer, 1, CURSOR_POINTER); /* link divs inherit */
 	/* Confirmed against hipecore's own source (RenderElement::visibleToHitTesting) that
 	 * pointer-events genuinely gates hit-testing here, not just parses harmlessly like
 	 * some other CSS this fork accepts but ignores -- essential, not decorative: without
@@ -1751,6 +1773,7 @@ int main(int argc, char** argv) {
 	 * of the frame just looked wrong. */
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, viewport, 2, "div", "navbar");
 	navbar = get_by_id("navbar");
+	hipe_send(session, HIPE_OP_SET_CURSOR, 0, navbar, 1, CURSOR_POINTER); /* buttons + zoom label inherit; page label overridden below */
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "display", "flex");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "align-items", "center");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, navbar, 2, "position", "fixed");
@@ -1792,7 +1815,7 @@ int main(int argc, char** argv) {
 	 * silently does nothing here (confirmed by checking RenderFlexibleBox.cpp in
 	 * hipecore -- no gap handling at all). */
 	hipe_send(session, HIPE_OP_ADD_STYLE_RULE, 0, 0, 2, "#navbar button",
-		"min-width:32px; padding:4px 8px; font-size:16px; cursor:pointer;");
+		"min-width:32px; padding:4px 8px; font-size:16px;");
 
 	const char* GROUP_MARGIN = "22px";  /* between page nav / zoom / slideshow */
 	const char* ITEM_MARGIN = "6px";    /* between controls within one group */
@@ -1833,6 +1856,7 @@ int main(int argc, char** argv) {
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, page_group, 2, "span", "pageLabel");
 	page_label = get_by_id("pageLabel");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, page_label, 2, "margin-right", ITEM_MARGIN);
+	hipe_send(session, HIPE_OP_SET_CURSOR, 0, page_label, 1, CURSOR_DEFAULT); /* just a readout -- not clickable, unlike its navbar siblings */
 
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, page_group, 2, "button", "nextBtn");
 	hipe_loc next_btn = get_by_id("nextBtn");
@@ -1852,9 +1876,9 @@ int main(int argc, char** argv) {
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, zoom_group, 2, "span", "zoomLabel");
 	zoom_label = get_by_id("zoomLabel");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, zoom_label, 2, "margin-right", ITEM_MARGIN);
-	/* Clicking the label itself resets to 100% zoom -- cursor:pointer as the only
-	 * affordance for this (no tooltip support to spell it out otherwise). */
-	hipe_send(session, HIPE_OP_SET_STYLE, 0, zoom_label, 2, "cursor", "pointer");
+	/* Clicking the label itself resets to 100% zoom; it inherits navbar's CURSOR_POINTER
+	 * (the only affordance for this -- no tooltip support to spell it out otherwise), unlike
+	 * the sibling pageLabel which is overridden back to the default arrow. */
 
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, zoom_group, 2, "button", "zoomInBtn");
 	hipe_loc zoom_in_btn = get_by_id("zoomInBtn");
@@ -1909,6 +1933,7 @@ int main(int argc, char** argv) {
 	 * rather than snapping in/out. */
 	hipe_send(session, HIPE_OP_APPEND_TAG, 0, main_area, 2, "div", "slideshowControls");
 	slideshow_controls = get_by_id("slideshowControls");
+	hipe_send(session, HIPE_OP_SET_CURSOR, 0, slideshow_controls, 1, CURSOR_POINTER); /* Menu / Leave buttons inherit */
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_controls, 2, "display", "flex");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_controls, 2, "opacity", "0");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, slideshow_controls, 2, "pointer-events", "none");
