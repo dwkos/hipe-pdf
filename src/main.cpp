@@ -347,6 +347,15 @@ static void update_slideshow_background(int page_number) {
 static void update_text_layer(int page_number, float scale) {
 	hipe_send(session, HIPE_OP_CLEAR, 0, text_layer, 0);
 
+	/* No selectable-text overlay during slideshow. Each span has pointer-events:auto (so a
+	 * drag can select it), and it sits between the raster and the click-to-advance listener
+	 * on img_page -- a click that lands on page text is caught by the span and, being on a
+	 * sibling of img_page rather than an ancestor, never bubbles to that listener, so it
+	 * silently selected text instead of advancing the slide. Cleared here and left empty
+	 * while presenting; leave_slideshow()'s re-render rebuilds it. Hyperlinks still work --
+	 * they're a separate overlay (#linkLayer, see update_link_layer). */
+	if (slideshow_active) return;
+
 	std::vector<PdfDocument::TextSpan> spans;
 	try {
 		spans = doc->pageTextSpans(page_number);
