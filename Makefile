@@ -27,4 +27,12 @@ third-party:
 clean:
 	rm -f build/*.o $(BIN)
 
-.PHONY: all clean third-party
+# Wipe the vendored MuPDF's build output (objects + libmupdf*.a) so `make
+# third-party` rebuilds it from scratch -- e.g. after moving the tree to a
+# different machine/toolchain. Leaves the checked-out MuPDF source untouched.
+clean-third-party:
+	rm -rf $(MUPDF_DIR)/build
+
+distclean: clean clean-third-party
+
+.PHONY: all clean clean-third-party distclean third-party
