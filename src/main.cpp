@@ -1449,6 +1449,127 @@ static void handle_incoming_fifo_get_peer(const hipe_instruction& ev) {
 	}
 }
 
+/* Handles one already-dequeued instruction. Called from the main loop below, and recursively
+ * from the REQ_RESIZE case: a live window drag can enqueue a burst of "resize" events faster
+ * than render_and_show() can keep up (it's a synchronous, blocking MuPDF raster render), which
+ * without this would leave the busy cursor churning through a backlog long after the user's
+ * last actual resize. Since libhipe's session queue has no requeue/put-back primitive (only
+ * hipe_next_instruction to pop), coalescing is done by peeking one instruction ahead
+ * (non-blocking) and recursing on it immediately rather than acting on a resize that's already
+ * stale: a further REQ_RESIZE means this one is superseded (recurse, let the tail of the run
+ * render), anything else means this is the last resize in the run (render now), then dispatch
+ * that instruction in its original arrival order. Recursion depth is bounded by how many resize
+ * events piled up in the socket buffer, so it converges -- each render absorbs whatever queued
+ * up during the previous one. */
+static void dispatch_event(hipe_instruction& event, bool embedded_mode) {
+	if (event.opcode == HIPE_OP_DIALOG_RETURN) {
+		if (event.requestor == REQ_SLIDESHOW_DIALOG) handle_slideshow_dialog_return(event);
+		return;
+	}
+
+	/* The environment's answer to a request_open_document() -- a real file path (top
+	 * level) or a FIFO path (framed). Handled here, like DIALOG_RETURN above, rather
+	 * than in the HIPE_OP_EVENT dispatch below. */
+	if (event.opcode == HIPE_OP_FIFO_RESPONSE) {
+		if (event.requestor == REQ_FIFO_GET_PDF) handle_fifo_response(event);
+		return;
+	}
+
+	/* Another app asking to hand us a document ("open with...") -- the FIFO host role,
+	 * matching the "Open" ability we advertised at startup. Ignored in embedded mode,
+	 * where it was never advertised. */
+	if (event.opcode == HIPE_OP_FIFO_GET_PEER) {
+		if (!embedded_mode) handle_incoming_fifo_get_peer(event);
+		return;
+	}
+
+	/* Leftover handshake traffic that lands after a synchronous FIFO exchange (host or
+	 * client) already ran to completion -- the client's own FIFO_OPEN/CLOSE, or a
+	 * DROP_PEER. handle_incoming_fifo_get_peer() drains and unlinks its pipe itself, so
+	 * these are normally no-ops; DROP_PEER is honoured as a backstop for a pipe still on
+	 * disk (e.g. our handler returned early). Never unlink on FIFO_OPEN -- that can
+	 * arrive mid-transfer. */
+	if (event.opcode == HIPE_OP_FIFO_OPEN || event.opcode == HIPE_OP_FIFO_CLOSE) {
+		DBG("ignoring stray %s\n", event.opcode == HIPE_OP_FIFO_OPEN ? "FIFO_OPEN" : "FIFO_CLOSE");
+		return;
+	}
+	if (event.opcode == HIPE_OP_FIFO_DROP_PEER) {
+		if (!host_fifo_path.empty() && event.arg[0] && host_fifo_path == event.arg[0]) {
+			unlink(host_fifo_path.c_str());
+			host_fifo_path.clear();
+		}
+		return;
+	}
+
+	if (event.opcode == HIPE_OP_FRAME_CLOSE) {
+		g_should_exit = true;
+		return;
+	}
+	if (event.opcode != HIPE_OP_EVENT) {
+		DBG("unhandled instruction opcode=%d\n", (int) event.opcode);
+		return;
+	}
+	/* requestor is only meaningful on HIPE_OP_EVENT replies to our own
+	 * EVENT_REQUESTs -- other instruction types can carry unrelated
+	 * requestor values that happen to collide with our REQ_* codes. */
+	if (event.requestor == REQ_OPEN) request_open_document();
+	/* Every other action needs a loaded document. With none (the no-file launch mode,
+	 * before the first Open), the toolbar isn't shown and #emptyState only emits
+	 * REQ_OPEN -- but guard anyway so a stray event can't reach code that dereferences
+	 * doc. */
+	else if (!doc) { /* nothing */ }
+	else if (event.requestor == REQ_SIDEBAR_TOGGLE) toggle_sidebar();
+	else if (event.requestor == REQ_PREV) render_and_show(current_page - 1, true);
+	else if (event.requestor == REQ_NEXT) render_and_show(current_page + 1);
+	else if (event.requestor == REQ_ZOOM_OUT) set_zoom(zoom_level / ZOOM_STEP);
+	else if (event.requestor == REQ_ZOOM_IN) set_zoom(zoom_level * ZOOM_STEP);
+	else if (event.requestor == REQ_ZOOM_RESET) set_zoom(1.0f);
+	else if (event.requestor == REQ_FIT_WIDTH) set_fit_mode(FitMode::WIDTH);
+	else if (event.requestor == REQ_FIT_PAGE) set_fit_mode(FitMode::PAGE);
+	else if (event.requestor == REQ_SLIDESHOW_ENTER) enter_slideshow();
+	else if (event.requestor == REQ_SLIDESHOW_LEAVE) leave_slideshow();
+	else if (event.requestor == REQ_SLIDESHOW_ADVANCE && slideshow_active) render_and_show(current_page + 1);
+	else if (event.requestor == REQ_SLIDESHOW_MENU && slideshow_active) show_slideshow_dialog();
+	else if (event.requestor == REQ_SLIDESHOW_MOUSEMOVE && slideshow_active) reveal_slideshow_controls();
+	else if (event.requestor == REQ_KEYDOWN) {
+		switch (event.arg[1] ? atoi(event.arg[1]) : 0) {
+			case KEY_PAGEUP: render_and_show(current_page - 1, true); break;
+			case KEY_PAGEDOWN: render_and_show(current_page + 1); break;
+			case KEY_HOME: render_and_show(0); break;
+			case KEY_END: render_and_show(page_count - 1); break;
+			case KEY_ARROWUP: handle_arrow_key(false); break;
+			case KEY_ARROWDOWN: handle_arrow_key(true); break;
+		}
+	}
+	else if (event.requestor == REQ_WHEEL) handle_wheel_event(parse_wheel_delta_y(event.arg[1]));
+	else if (event.requestor == REQ_RESIZE && fit_mode != FitMode::NONE) {
+		hipe_instruction next;
+		hipe_instruction_init(&next);
+		short got = hipe_next_instruction(session, &next, /*blocking=*/0);
+		if (got > 0 && next.opcode == HIPE_OP_EVENT && next.requestor == REQ_RESIZE) {
+			dispatch_event(next, embedded_mode); /* superseded by a newer resize -- let the tail of the run render */
+		} else {
+			render_and_show(current_page); /* last resize in this run -- settle here */
+			if (got > 0) dispatch_event(next, embedded_mode); /* handle whatever followed it, in arrival order */
+			else if (got < 0) g_should_exit = true; /* disconnect surfaced mid-drain */
+		}
+		hipe_instruction_clear(&next);
+	}
+	/* Checked before the REQ_THUMB_BASE range below despite both being open-ended
+	 * ">=" comparisons -- REQ_LINK_BASE sits far above REQ_THUMB_BASE's own range
+	 * specifically so a link click can never be misread as an out-of-range thumbnail
+	 * click, but only if this check runs first. */
+	else if (event.requestor >= REQ_LINK_BASE) {
+		int idx = (int) (event.requestor - REQ_LINK_BASE);
+		if (idx >= 0 && idx < (int) current_page_links.size()) {
+			const auto& link = current_page_links[idx];
+			if (link.is_external) hipe_send(session, HIPE_OP_OPEN_LINK, 0, 0, 1, link.uri.c_str());
+			else render_and_show(link.target_page);
+		}
+	}
+	else if (event.requestor >= REQ_THUMB_BASE) render_and_show((int) (event.requestor - REQ_THUMB_BASE));
+}
+
 int main(int argc, char** argv) {
 	/* Two launch modes:
 	 *   - with a file argument: "embedded document" mode -- open that file, no Open button
@@ -2021,99 +2142,8 @@ int main(int argc, char** argv) {
 			continue;
 		}
 
-		if (event.opcode == HIPE_OP_DIALOG_RETURN) {
-			if (event.requestor == REQ_SLIDESHOW_DIALOG) handle_slideshow_dialog_return(event);
-			continue;
-		}
-
-		/* The environment's answer to a request_open_document() -- a real file path (top
-		 * level) or a FIFO path (framed). Handled here, like DIALOG_RETURN above, rather
-		 * than in the HIPE_OP_EVENT dispatch below. */
-		if (event.opcode == HIPE_OP_FIFO_RESPONSE) {
-			if (event.requestor == REQ_FIFO_GET_PDF) handle_fifo_response(event);
-			if (g_should_exit) break;
-			continue;
-		}
-
-		/* Another app asking to hand us a document ("open with...") -- the FIFO host role,
-		 * matching the "Open" ability we advertised at startup. Ignored in embedded mode,
-		 * where it was never advertised. */
-		if (event.opcode == HIPE_OP_FIFO_GET_PEER) {
-			if (!embedded_mode) handle_incoming_fifo_get_peer(event);
-			if (g_should_exit) break;
-			continue;
-		}
-
-		/* Leftover handshake traffic that lands after a synchronous FIFO exchange (host or
-		 * client) already ran to completion -- the client's own FIFO_OPEN/CLOSE, or a
-		 * DROP_PEER. handle_incoming_fifo_get_peer() drains and unlinks its pipe itself, so
-		 * these are normally no-ops; DROP_PEER is honoured as a backstop for a pipe still on
-		 * disk (e.g. our handler returned early). Never unlink on FIFO_OPEN -- that can
-		 * arrive mid-transfer. */
-		if (event.opcode == HIPE_OP_FIFO_OPEN || event.opcode == HIPE_OP_FIFO_CLOSE) {
-			DBG("ignoring stray %s\n", event.opcode == HIPE_OP_FIFO_OPEN ? "FIFO_OPEN" : "FIFO_CLOSE");
-			continue;
-		}
-		if (event.opcode == HIPE_OP_FIFO_DROP_PEER) {
-			if (!host_fifo_path.empty() && event.arg[0] && host_fifo_path == event.arg[0]) {
-				unlink(host_fifo_path.c_str());
-				host_fifo_path.clear();
-			}
-			continue;
-		}
-
-		if (event.opcode != HIPE_OP_EVENT) {
-			if (event.opcode != HIPE_OP_FRAME_CLOSE)
-				DBG("unhandled instruction opcode=%d\n", (int) event.opcode);
-			continue;
-		}
-		/* requestor is only meaningful on HIPE_OP_EVENT replies to our own
-		 * EVENT_REQUESTs -- other instruction types can carry unrelated
-		 * requestor values that happen to collide with our REQ_* codes. */
-		if (event.requestor == REQ_OPEN) request_open_document();
-		/* Every other action needs a loaded document. With none (the no-file launch mode,
-		 * before the first Open), the toolbar isn't shown and #emptyState only emits
-		 * REQ_OPEN -- but guard anyway so a stray event can't reach code that dereferences
-		 * doc. */
-		else if (!doc) { /* nothing */ }
-		else if (event.requestor == REQ_SIDEBAR_TOGGLE) toggle_sidebar();
-		else if (event.requestor == REQ_PREV) render_and_show(current_page - 1, true);
-		else if (event.requestor == REQ_NEXT) render_and_show(current_page + 1);
-		else if (event.requestor == REQ_ZOOM_OUT) set_zoom(zoom_level / ZOOM_STEP);
-		else if (event.requestor == REQ_ZOOM_IN) set_zoom(zoom_level * ZOOM_STEP);
-		else if (event.requestor == REQ_ZOOM_RESET) set_zoom(1.0f);
-		else if (event.requestor == REQ_FIT_WIDTH) set_fit_mode(FitMode::WIDTH);
-		else if (event.requestor == REQ_FIT_PAGE) set_fit_mode(FitMode::PAGE);
-		else if (event.requestor == REQ_SLIDESHOW_ENTER) enter_slideshow();
-		else if (event.requestor == REQ_SLIDESHOW_LEAVE) leave_slideshow();
-		else if (event.requestor == REQ_SLIDESHOW_ADVANCE && slideshow_active) render_and_show(current_page + 1);
-		else if (event.requestor == REQ_SLIDESHOW_MENU && slideshow_active) show_slideshow_dialog();
-		else if (event.requestor == REQ_SLIDESHOW_MOUSEMOVE && slideshow_active) reveal_slideshow_controls();
-		else if (event.requestor == REQ_KEYDOWN) {
-			switch (event.arg[1] ? atoi(event.arg[1]) : 0) {
-				case KEY_PAGEUP: render_and_show(current_page - 1, true); break;
-				case KEY_PAGEDOWN: render_and_show(current_page + 1); break;
-				case KEY_HOME: render_and_show(0); break;
-				case KEY_END: render_and_show(page_count - 1); break;
-				case KEY_ARROWUP: handle_arrow_key(false); break;
-				case KEY_ARROWDOWN: handle_arrow_key(true); break;
-			}
-		}
-		else if (event.requestor == REQ_WHEEL) handle_wheel_event(parse_wheel_delta_y(event.arg[1]));
-		else if (event.requestor == REQ_RESIZE && fit_mode != FitMode::NONE) render_and_show(current_page);
-		/* Checked before the REQ_THUMB_BASE range below despite both being open-ended
-		 * ">=" comparisons -- REQ_LINK_BASE sits far above REQ_THUMB_BASE's own range
-		 * specifically so a link click can never be misread as an out-of-range thumbnail
-		 * click, but only if this check runs first. */
-		else if (event.requestor >= REQ_LINK_BASE) {
-			int idx = (int) (event.requestor - REQ_LINK_BASE);
-			if (idx >= 0 && idx < (int) current_page_links.size()) {
-				const auto& link = current_page_links[idx];
-				if (link.is_external) hipe_send(session, HIPE_OP_OPEN_LINK, 0, 0, 1, link.uri.c_str());
-				else render_and_show(link.target_page);
-			}
-		}
-		else if (event.requestor >= REQ_THUMB_BASE) render_and_show((int) (event.requestor - REQ_THUMB_BASE));
+		dispatch_event(event, embedded_mode);
+		if (g_should_exit) break;
 	} while (event.opcode != HIPE_OP_FRAME_CLOSE);
 
 	if (!embedded_mode)
