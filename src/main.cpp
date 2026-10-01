@@ -5,13 +5,13 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <memory>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include <fcntl.h>
@@ -152,7 +152,7 @@ static hipe_loc slideshow_menu_btn;
 static hipe_loc slideshow_leave_btn;
 static hipe_loc page_label;
 static hipe_loc zoom_label;
-static float navbar_clearance_px = 0.0f; /* measured once after navbar is built -- see main() */
+static float navbar_clearance_px = 0.0f; /* toolbar height + a margin -- measured in render_and_show() */
 static float base_render_width = 800.0f;
 static float zoom_level = 1.0f;
 static float render_width = 800.0f;
@@ -215,6 +215,10 @@ struct ResolvedLink {
 	int target_page; /* only meaningful when !is_external */
 };
 static std::vector<ResolvedLink> current_page_links;
+/* Locations of the elements currently in #textLayer and #linkLayer, kept so they can be
+ * freed when the layer is next rebuilt -- see clear_and_free(). */
+static std::vector<hipe_loc> text_span_locs;
+static std::vector<hipe_loc> link_locs;
 
 /* Opt-in tracing for the FIFO import/export handshakes (client and host), which run against
  * a framing manager and so can't be stepped through here. Set HIPE_PDF_DEBUG=1 to see how
@@ -229,11 +233,26 @@ static bool debug_enabled() {
 }
 #define DBG(...) do { if (debug_enabled()) { fprintf(stderr, "hipe-pdf: " __VA_ARGS__); fflush(stderr); } } while (0)
 
+/* Waits for the reply to a request just sent. Returns false if the server went away instead
+ * (hipe_await_instruction's -1): instr is then left initialised but empty, with every arg
+ * null, and g_should_exit is set so the main loop exits once the caller unwinds. Read reply
+ * arguments through reply_float(), which treats a missing one as 0, so a caller needn't
+ * check the result just to stay safe. */
+static bool await_reply(hipe_instruction* instr, short opcode) {
+	hipe_instruction_init(instr);
+	if (hipe_await_instruction(session, instr, opcode) > 0) return true;
+	g_should_exit = true;
+	return false;
+}
+
+static float reply_float(const hipe_instruction& instr, int i) {
+	return instr.arg[i] ? (float) atof(instr.arg[i]) : 0.0f;
+}
+
 static hipe_loc get_by_id(const char* id) {
 	hipe_send(session, HIPE_OP_GET_BY_ID, 0, 0, 1, id);
 	hipe_instruction instr;
-	hipe_instruction_init(&instr);
-	hipe_await_instruction(session, &instr, HIPE_OP_LOCATION_RETURN);
+	if (!await_reply(&instr, HIPE_OP_LOCATION_RETURN)) return 0;
 	hipe_loc loc = instr.location;
 	hipe_instruction_clear(&instr);
 	return loc;
@@ -242,13 +261,33 @@ static hipe_loc get_by_id(const char* id) {
 static void get_geometry(hipe_loc target, float* out_w, float* out_h, float* out_x = nullptr, float* out_y = nullptr) {
 	hipe_send(session, HIPE_OP_GET_GEOMETRY, 0, target, 0);
 	hipe_instruction instr;
-	hipe_instruction_init(&instr);
-	hipe_await_instruction(session, &instr, HIPE_OP_GEOMETRY_RETURN);
-	if (out_x) *out_x = atof(instr.arg[0]);
-	if (out_y) *out_y = atof(instr.arg[1]);
-	if (out_w) *out_w = atof(instr.arg[2]);
-	if (out_h) *out_h = atof(instr.arg[3]);
+	await_reply(&instr, HIPE_OP_GEOMETRY_RETURN);
+	if (out_x) *out_x = reply_float(instr, 0);
+	if (out_y) *out_y = reply_float(instr, 1);
+	if (out_w) *out_w = reply_float(instr, 2);
+	if (out_h) *out_h = reply_float(instr, 3);
 	hipe_instruction_clear(&instr);
+}
+
+/* Vertical scroll position of a scrollable element, and the total height of its content. */
+static void get_scroll_geometry(hipe_loc target, float* out_scroll_top, float* out_scroll_height) {
+	hipe_send(session, HIPE_OP_GET_SCROLL_GEOMETRY, 0, target, 0);
+	hipe_instruction instr;
+	await_reply(&instr, HIPE_OP_GEOMETRY_RETURN);
+	if (out_scroll_top) *out_scroll_top = reply_float(instr, 1);
+	if (out_scroll_height) *out_scroll_height = reply_float(instr, 3);
+	hipe_instruction_clear(&instr);
+}
+
+/* Empties a container and gives back the locations of the elements that were in it.
+ * HIPE_OP_CLEAR removes the elements themselves, but a location stays allocated (in libhipe
+ * and in the display server) until it is freed -- and the text and link layers are rebuilt
+ * on every render, a line or a link at a time. */
+static void clear_and_free(hipe_loc container, std::vector<hipe_loc>& child_locs) {
+	hipe_send(session, HIPE_OP_CLEAR, 0, container, 0);
+	for (hipe_loc loc : child_locs)
+		if (loc) hipe_send(session, HIPE_OP_FREE_LOCATION, 0, loc, 0);
+	child_locs.clear();
 }
 
 static void update_page_label() {
@@ -342,12 +381,8 @@ static void scroll_thumbnail_into_view(int page_number) {
 	float thumb_h = 0, thumb_y = 0;
 	get_geometry(thumb, nullptr, &thumb_h, nullptr, &thumb_y);
 
-	hipe_send(session, HIPE_OP_GET_SCROLL_GEOMETRY, 0, sidebar, 0);
-	hipe_instruction instr;
-	hipe_instruction_init(&instr);
-	hipe_await_instruction(session, &instr, HIPE_OP_GEOMETRY_RETURN);
-	float scroll_top = atof(instr.arg[1]);
-	hipe_instruction_clear(&instr);
+	float scroll_top = 0;
+	get_scroll_geometry(sidebar, &scroll_top, nullptr);
 
 	/* GET_GEOMETRY reports a scroll-independent position (confirmed empirically: it
 	 * doesn't change as the sidebar is scrolled), so thumb_y/sidebar_y already give the
@@ -389,7 +424,7 @@ static void update_slideshow_background(int page_number) {
 }
 
 static void update_text_layer(int page_number, float scale) {
-	hipe_send(session, HIPE_OP_CLEAR, 0, text_layer, 0);
+	clear_and_free(text_layer, text_span_locs);
 
 	/* No selectable-text overlay during slideshow. Each span has pointer-events:auto (so a
 	 * drag can select it), and it sits between the raster and the click-to-advance listener
@@ -408,19 +443,48 @@ static void update_text_layer(int page_number, float scale) {
 		return;
 	}
 
-	char buf[16];
+	/* font-size can only be estimated from the line's height: the overlay is drawn in
+	 * whatever sans-serif font the display server has, not the PDF's own, so the same size
+	 * comes out a different width. HIPE_OP_MEASURE_TEXT says how wide each line really is
+	 * at its estimated size, and the span is then stretched or squeezed horizontally
+	 * (transform:scaleX, as PDF.js does) to exactly the width the line has on the page.
+	 * That puts both ends of every line in the right place; within a line the two fonts'
+	 * letter proportions can still differ by a few pixels.
+	 *
+	 * Every line is measured before any span is built, a batch at a time: the requests go
+	 * out together and the replies come back in the same order, so a page costs a few round
+	 * trips rather than one per line. The batch size just keeps the unread replies well
+	 * inside the socket's buffer. */
+	auto font_px = [&](const PdfDocument::TextSpan& span) {
+		return std::max(1, (int) (span.height * scale * 0.9f));
+	};
+	std::vector<float> natural_width(spans.size(), 0.0f);
+	char buf[32];
+	const size_t MEASURE_BATCH = 256;
+	for (size_t start = 0; start < spans.size(); start += MEASURE_BATCH) {
+		size_t end = std::min(spans.size(), start + MEASURE_BATCH);
+		for (size_t i = start; i < end; i++) {
+			snprintf(buf, sizeof(buf), "%d", font_px(spans[i]));
+			hipe_send(session, HIPE_OP_MEASURE_TEXT, 0, text_layer, 2, spans[i].text.c_str(), buf);
+		}
+		for (size_t i = start; i < end; i++) {
+			hipe_instruction metrics;
+			if (!await_reply(&metrics, HIPE_OP_TEXT_METRICS)) return;
+			natural_width[i] = reply_float(metrics, 0);
+			hipe_instruction_clear(&metrics);
+		}
+	}
+
+	text_span_locs.reserve(spans.size());
 	for (size_t i = 0; i < spans.size(); i++) {
 		const auto& span = spans[i];
-		hipe_send(session, HIPE_OP_APPEND_TAG, 0, text_layer, 1, "span");
+		hipe_send(session, HIPE_OP_APPEND_TAG, 0, text_layer, 4, "span", (char*) nullptr, (char*) nullptr, span.text.c_str());
 		hipe_loc loc = hipe_newest_location();
-		hipe_send(session, HIPE_OP_SET_TEXT, 0, loc, 1, span.text.c_str());
+		text_span_locs.push_back(loc);
 
 		/* Common properties (position:absolute, color:transparent, etc.) come from the
 		 * "#textLayer span" rule added once at startup; only per-span geometry needs
-		 * setting here. font-size is approximated from line height -- Hipe has no
-		 * client-side text-measurement API to CSS-scale each span to its exact glyph
-		 * run the way PDF.js does, so this is "close enough to select", not
-		 * pixel-perfect. */
+		 * setting here. */
 
 		/* Stretch the box (not the font-size/line-height, which stay true to the actual
 		 * line) down to the next line's top, so there's no gap between lines for the
@@ -442,19 +506,52 @@ static void update_text_layer(int page_number, float scale) {
 		hipe_send(session, HIPE_OP_SET_STYLE, 0, loc, 2, "left", buf);
 		snprintf(buf, sizeof(buf), "%dpx", (int) (span.y * scale));
 		hipe_send(session, HIPE_OP_SET_STYLE, 0, loc, 2, "top", buf);
-		snprintf(buf, sizeof(buf), "%dpx", (int) (span.width * scale + 1));
-		hipe_send(session, HIPE_OP_SET_STYLE, 0, loc, 2, "width", buf);
 		snprintf(buf, sizeof(buf), "%dpx", (int) (box_height * scale + 1));
 		hipe_send(session, HIPE_OP_SET_STYLE, 0, loc, 2, "height", buf);
 		snprintf(buf, sizeof(buf), "%dpx", (int) (span.height * scale));
 		hipe_send(session, HIPE_OP_SET_STYLE, 0, loc, 2, "line-height", buf);
-		snprintf(buf, sizeof(buf), "%dpx", (int) (span.height * scale * 0.9f));
+		snprintf(buf, sizeof(buf), "%dpx", font_px(span));
 		hipe_send(session, HIPE_OP_SET_STYLE, 0, loc, 2, "font-size", buf);
+
+		if (natural_width[i] > 0.0f) {
+			/* No width is set: the box shrinks to the text's own natural width, and the
+			 * scale then brings box and text together to the line's real width. */
+			snprintf(buf, sizeof(buf), "scaleX(%.4f)", span.width * scale / natural_width[i]);
+			hipe_send(session, HIPE_OP_SET_STYLE, 0, loc, 2, "transform", buf);
+		} else {
+			/* Not measured (nothing to measure, or a display server without
+			 * MEASURE_TEXT, which answers with empty values): leave the text at its
+			 * estimated size in a box of the line's real width. */
+			snprintf(buf, sizeof(buf), "%dpx", (int) (span.width * scale + 1));
+			hipe_send(session, HIPE_OP_SET_STYLE, 0, loc, 2, "width", buf);
+		}
+	}
+
+	/* HIPE_PDF_DEBUG: report how far each line's text, as actually laid out, is from the
+	 * width it has on the page. */
+	if (debug_enabled()) {
+		float worst = 0.0f, total = 0.0f;
+		int measured = 0;
+		for (size_t i = 0; i < spans.size(); i++) {
+			hipe_send(session, HIPE_OP_GET_RANGE_GEOMETRY, 0, text_span_locs[i], 2, "0", "-1");
+			hipe_instruction range;
+			if (!await_reply(&range, HIPE_OP_RANGE_GEOMETRY)) return;
+			float x, y, w, h;
+			if (range.arg[0] && sscanf(range.arg[0], "%f,%f,%f,%f", &x, &y, &w, &h) == 4) {
+				float off = std::fabs(w - spans[i].width * scale);
+				worst = std::max(worst, off);
+				total += off;
+				measured++;
+			}
+			hipe_instruction_clear(&range);
+		}
+		DBG("text layer page %d: %d lines, width off by %.1fpx on average, %.1fpx at worst\n",
+			page_number + 1, measured, measured ? total / measured : 0.0f, worst);
 	}
 }
 
 static void update_link_layer(int page_number, float scale) {
-	hipe_send(session, HIPE_OP_CLEAR, 0, link_layer, 0);
+	clear_and_free(link_layer, link_locs);
 	current_page_links.clear();
 
 	std::vector<PdfDocument::PageLink> links;
@@ -475,6 +572,7 @@ static void update_link_layer(int page_number, float scale) {
 
 		hipe_send(session, HIPE_OP_APPEND_TAG, 0, link_layer, 1, "div");
 		hipe_loc loc = hipe_newest_location();
+		link_locs.push_back(loc);
 
 		/* Common properties (position:absolute, pointer-events:auto, ...) come from the
 		 * "#linkLayer div" rule added once at startup, and the CURSOR_POINTER glyph is
@@ -552,6 +650,7 @@ static void check_slideshow_controls_idle_timeout() {
 
 static void render_and_show(int page_number, bool land_at_bottom = false) {
 	if (page_number < 0 || page_number >= page_count) return;
+	if (g_should_exit) return; /* the server is gone; nothing to render for */
 	bool page_changed = (page_number != current_page);
 	int previous_page = current_page; /* for a less-jarring loading-placeholder color below */
 	current_page = page_number;
@@ -570,6 +669,15 @@ static void render_and_show(int page_number, bool land_at_bottom = false) {
 
 	float viewport_w = 0, viewport_h = 0;
 	get_geometry(viewport, &viewport_w, &viewport_h);
+	/* How much room the floating toolbar needs above the page (see apply_fit_mode and
+	 * top_reserve below). Measured on every render rather than once at startup, so a
+	 * reading taken before the frame had settled can't stick for the whole session. Not
+	 * in slideshow, where the toolbar is hidden and reports no height. */
+	if (!slideshow_active) {
+		float navbar_h = 0;
+		get_geometry(navbar, nullptr, &navbar_h);
+		if (navbar_h > 0) navbar_clearance_px = navbar_h + 12.0f; /* + a little breathing room below it */
+	}
 
 	apply_fit_mode(aspect_h_over_w, viewport_w, viewport_h);
 
@@ -623,14 +731,14 @@ static void render_and_show(int page_number, bool land_at_bottom = false) {
 	 * raster is still perfectly good to look at -- it's already stretching to fill
 	 * page_wrapper's just-updated box via its own 100%/100% sizing above, so it works as
 	 * an instant preview of roughly the new size with zero extra code, instead of
-	 * replacing it with a blank loading screen. hipe_send() writes straight to the
-	 * socket with no client-side buffering, so when the placeholder IS needed, it
-	 * reaches the display before the CPU-bound render below starts. */
+	 * replacing it with a blank loading screen. When the placeholder IS needed, the
+	 * hipe_flush() below is what gets it (and the busy cursor) to the display before the
+	 * CPU-bound render starts -- sends are buffered (see main()). */
 	if (!current_page_has_raster) {
 		/* Drop the old page's text spans and link targets now rather than leaving them
 		 * selectable/clickable underneath the overlay. */
-		hipe_send(session, HIPE_OP_CLEAR, 0, text_layer, 0);
-		hipe_send(session, HIPE_OP_CLEAR, 0, link_layer, 0);
+		clear_and_free(text_layer, text_span_locs);
+		clear_and_free(link_layer, link_locs);
 		current_page_links.clear();
 
 		/* Colored to match the page just being left (previous_page -- on the very first
@@ -658,6 +766,7 @@ static void render_and_show(int page_number, bool land_at_bottom = false) {
 
 	is_busy = true;
 	hipe_send(session, HIPE_OP_SET_CURSOR, 0, 0, 1, CURSOR_BUSY);
+	hipe_flush(session);
 	std::vector<uint8_t> png;
 	bool low_res_fallback = false;
 	/* A page whose own thumbnail render took far longer than the batch's median (see
@@ -762,9 +871,10 @@ static const auto WHEEL_EDGE_DWELL = std::chrono::milliseconds(250);
 static const auto WHEEL_NO_SCROLL_COOLDOWN = std::chrono::milliseconds(500);
 static const auto WHEEL_RENDER_SETTLE = std::chrono::milliseconds(300);
 
-/* wheel event details are "deltaX,deltaY,deltaMode" (see requestEvent() in hipecore's
- * qwebelement.cpp) -- only the sign of deltaY matters here, regardless of deltaMode
- * (pixel/line/page), so no unit conversion is needed. */
+/* wheel event details are "deltaX,deltaY,deltaMode,modifiers" (see HIPE_OP_EVENT). The
+ * server adds up the deltas of a fast burst into one event, but only the sign of deltaY
+ * matters here, regardless of size or deltaMode (pixel/line/page), so no unit conversion
+ * is needed. */
 static float parse_wheel_delta_y(const char* details) {
 	if (!details) return 0.0f;
 	const char* comma = strchr(details, ',');
@@ -793,13 +903,8 @@ static void handle_wheel_event(float delta_y) {
 
 	bool wants_forward = delta_y > 0;
 
-	hipe_send(session, HIPE_OP_GET_SCROLL_GEOMETRY, 0, viewport, 0);
-	hipe_instruction instr;
-	hipe_instruction_init(&instr);
-	hipe_await_instruction(session, &instr, HIPE_OP_GEOMETRY_RETURN);
-	float scroll_top = atof(instr.arg[1]);
-	float scroll_height = atof(instr.arg[3]);
-	hipe_instruction_clear(&instr);
+	float scroll_top = 0, scroll_height = 0;
+	get_scroll_geometry(viewport, &scroll_top, &scroll_height);
 
 	float viewport_h = 0;
 	get_geometry(viewport, nullptr, &viewport_h);
@@ -849,13 +954,8 @@ static void handle_arrow_key(bool down) {
 	 * the pressed direction, they turn the page instead. Unlike the wheel, each
 	 * keydown (including OS key-repeat while held) is a discrete, intentional
 	 * request, so no burst/cooldown guard is needed here. */
-	hipe_send(session, HIPE_OP_GET_SCROLL_GEOMETRY, 0, viewport, 0);
-	hipe_instruction instr;
-	hipe_instruction_init(&instr);
-	hipe_await_instruction(session, &instr, HIPE_OP_GEOMETRY_RETURN);
-	float scroll_top = atof(instr.arg[1]);
-	float scroll_height = atof(instr.arg[3]);
-	hipe_instruction_clear(&instr);
+	float scroll_top = 0, scroll_height = 0;
+	get_scroll_geometry(viewport, &scroll_top, &scroll_height);
 
 	float viewport_h = 0;
 	get_geometry(viewport, nullptr, &viewport_h);
@@ -930,10 +1030,10 @@ static void enter_slideshow() {
 	/* Dropped so the page blends into the color-matched surround instead of standing
 	 * out inside a boxed frame -- update_slideshow_background() takes over from here. */
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "box-shadow", "none");
-	/* Requesting "contextmenu" always forces preventDefault on the server side (not
-	 * something our request controls), suppressing the native menu -- including its
-	 * Copy item for a text selection. So this is only requested while actually in
-	 * slideshow, not unconditionally at startup, so text stays copyable otherwise. */
+	/* Requesting "contextmenu" this way (no arg[1]) cancels the right-click's default
+	 * action, replacing the framing manager's edit menu -- including its Copy item for a
+	 * text selection -- with our slideshow dialog. That's wanted while presenting, so it's
+	 * requested here rather than at startup, and text stays copyable otherwise. */
 	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_SLIDESHOW_MENU, main_area, 1, "contextmenu");
 	/* On img_page specifically, not main_area -- slideshow_controls (the Menu/Leave pair's
 	 * container) is a direct child of main_area, a sibling of #viewport (which contains
@@ -1095,6 +1195,9 @@ static void build_thumbnail_sidebar(hipe_loc sidebar) {
 		hipe_send_instruction(session, instr);
 
 		hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_THUMB_BASE + i, thumb, 1, "click");
+		/* Sends are buffered (see main()): push each thumbnail out before starting on
+		 * the next render, so they appear one by one rather than all at the end. */
+		hipe_flush(session);
 	}
 
 	/* Median rather than mean so a handful of genuinely pathological pages (which is
@@ -1153,8 +1256,7 @@ static void swap_in_document(std::unique_ptr<PdfDocument> new_doc, const std::st
 	 * page_is_flagged_complex()/smart_starting_width() read from (those two vectors + the
 	 * median are the whole cache). highlighted_thumb is reset so a stale index can't clear
 	 * the border on one of the incoming thumbnails. */
-	hipe_send(session, HIPE_OP_CLEAR, 0, sidebar, 0);
-	thumb_locs.clear();
+	clear_and_free(sidebar, thumb_locs);
 	thumb_render_ms.clear();
 	thumb_render_ms_median = 0.0;
 	highlighted_thumb = -1;
@@ -1213,7 +1315,7 @@ static void request_open_document() {
  * FIFO_DROP_PEER instruction from the peer for `fifo_path`. The file shell's exporter keeps
  * its write fd open and signals completion with the instruction rather than an EOF (see
  * ~/export/export.cpp), so a pure pipe-poll loop would stall here until the 30s cap -- hence
- * the hipe socket is also pumped, non-blocking, each iteration. A FRAME_CLOSE or lost server
+ * the wait is on the pipe and the Hipe connection together. A FRAME_CLOSE or lost server
  * connection mid-transfer sets g_should_exit and ends the drain; any other instruction that
  * lands during the transfer window is dropped (logged under HIPE_PDF_DEBUG).
  *
@@ -1231,22 +1333,9 @@ static std::vector<uint8_t> drain_fifo(int fd, const char* fifo_path, const char
 	hipe_instruction_init(&tmp);
 
 	while (!eof && !peer_closed) {
-		struct pollfd pfd = { fd, POLLIN, 0 };
-		int pr = poll(&pfd, 1, 200);
-		if (pr < 0 && errno != EINTR) {
-			fprintf(stderr, "%s: poll: %s\n", who, strerror(errno));
-			break;
-		}
-		if (pr > 0 && (pfd.revents & (POLLIN | POLLHUP))) {
-			ssize_t n;
-			while ((n = read(fd, chunk, sizeof(chunk))) > 0)
-				bytes.insert(bytes.end(), chunk, chunk + n);
-			if (n == 0) eof = true;
-			else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-				fprintf(stderr, "%s: read: %s\n", who, strerror(errno));
-				break;
-			}
-		}
+		/* Instructions first: libhipe may already have some queued, which wouldn't wake
+		 * the poll() below (see hipe_session_fd()), and checking for them also sends
+		 * anything of ours still waiting in the send buffer. */
 		short got;
 		while (!peer_closed && (got = hipe_next_instruction(session, &tmp, 0)) != 0) {
 			if (got < 0) { g_should_exit = true; peer_closed = true; break; }
@@ -1263,9 +1352,30 @@ static std::vector<uint8_t> drain_fifo(int fd, const char* fifo_path, const char
 				DBG("%s: dropped instruction opcode=%d during transfer\n", who, (int) tmp.opcode);
 			}
 		}
-		if (!eof && !peer_closed && std::chrono::steady_clock::now() > deadline) {
+		if (peer_closed) break;
+
+		auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+			deadline - std::chrono::steady_clock::now()).count();
+		if (left <= 0) {
 			fprintf(stderr, "%s: timed out after 30s (%zu bytes so far)\n", who, bytes.size());
 			break;
+		}
+		struct pollfd pfds[2] = { { fd, POLLIN, 0 }, { hipe_session_fd(session), POLLIN, 0 } };
+		if (pfds[1].fd < 0) { g_should_exit = true; break; }
+		int pr = poll(pfds, 2, (int) left);
+		if (pr < 0 && errno != EINTR) {
+			fprintf(stderr, "%s: poll: %s\n", who, strerror(errno));
+			break;
+		}
+		if (pr > 0 && (pfds[0].revents & (POLLIN | POLLHUP))) {
+			ssize_t n;
+			while ((n = read(fd, chunk, sizeof(chunk))) > 0)
+				bytes.insert(bytes.end(), chunk, chunk + n);
+			if (n == 0) eof = true;
+			else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+				fprintf(stderr, "%s: read: %s\n", who, strerror(errno));
+				break;
+			}
 		}
 	}
 	hipe_instruction_clear(&tmp);
@@ -1680,6 +1790,12 @@ int main(int argc, char** argv) {
 
 	session = hipe_open_session(0, 0, 0, argv[0]);
 	if (!session) return 3;
+	/* Collect outgoing instructions and send them together: building a page's text layer
+	 * is several instructions per line, and the interface below a few hundred. libhipe
+	 * sends what's waiting whenever we wait or check for an instruction; anywhere else
+	 * that the screen has to be up to date before we go quiet -- a blocking render, or a
+	 * poll() of our own -- needs an explicit hipe_flush(). */
+	hipe_set_buffered(session, 1);
 
 	{
 		hipe_instruction icon_instr;
@@ -1710,13 +1826,13 @@ int main(int argc, char** argv) {
 	/* Shared text-overlay span properties; per-span geometry is set individually in
 	 * update_text_layer(). "style" isn't in the server's SET_ATTRIBUTE whitelist, so this
 	 * (rather than one combined inline style per span) is how the fixed parts are set.
-	 * overflow:visible (not hidden) matters here: font-size is only approximated from
-	 * line height (no client-side text-measurement API to size it exactly), so the
-	 * invisible text can render wider than its box's width, computed from the real PDF
-	 * line bbox. With overflow:hidden that excess got clipped away and was unreachable
-	 * by the mouse entirely; visible lets it render (still invisibly) past the box at
-	 * its natural position, staying selectable there. #textLayer's own overflow:hidden
-	 * still bounds everything to the page itself, just not per span. */
+	 * transform-origin is for the per-span scaleX that fits each line to its real width:
+	 * the line's left edge is what has to stay put. overflow:visible (not hidden) only
+	 * matters for a span that couldn't be measured and so isn't scaled (see
+	 * update_text_layer()): its text can then be wider than its box, and with
+	 * overflow:hidden the excess was clipped away and unreachable by the mouse; visible
+	 * lets it render (still invisibly) past the box, staying selectable there.
+	 * #textLayer's own overflow:hidden still bounds everything to the page itself. */
 	/* pointer-events:auto here counteracts #textLayer's own pointer-events:none (see its
 	 * DOM setup below) -- discovered this needed doing (not assumed) after rescoping the
 	 * slideshow click-to-advance listener from main_area to img_page specifically: with
@@ -1729,7 +1845,16 @@ int main(int argc, char** argv) {
 	 * this override every span would inherit the container's none too). */
 	hipe_send(session, HIPE_OP_ADD_STYLE_RULE, 0, 0, 2, "#textLayer span",
 		"position:absolute; color:transparent; white-space:nowrap; overflow:visible; "
+		"-webkit-transform-origin:0 0; transform-origin:0 0; "
 		"pointer-events:auto; -webkit-user-select:text; user-select:text;");
+	/* How a HIPE_OP_FIND_TEXT match in the page text is shown -- the framing manager's Find
+	 * searches this frame, and only #textLayer's spans are selectable, so only they are
+	 * searched. The theme's own rule paints matches as dark text on a solid colour, which
+	 * here would draw the overlay's stand-in font over the page's real lettering. A
+	 * translucent highlight with the text left transparent marks the place and lets the
+	 * page show through. (The selected match is drawn as the selection, like any other.) */
+	hipe_send(session, HIPE_OP_ADD_STYLE_RULE, 0, 0, 2, "#textLayer span::search-text",
+		"background-color:rgba(255,200,60,0.45); color:transparent;");
 	/* Shared link-overlay div properties; per-link geometry is set individually in
 	 * update_link_layer(). user-select:none so a click-drag starting on a link doesn't
 	 * fight with the text layer underneath for a selection instead of registering as a
@@ -1875,13 +2000,11 @@ int main(int argc, char** argv) {
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "background", "white");
 	hipe_send(session, HIPE_OP_SET_STYLE, 0, img_page, 2, "box-shadow", "3px 3px 6px rgba(0,0,0,0.55), -6px -6px 5px rgba(255,255,255,0.2)");
 
-	/* Experimental: an invisible, selectable text overlay in the Acrobat/PDF.js style --
-	 * real text nodes positioned atop the raster image so the underlying content can be
-	 * selected/copied, without needing DOM-level SVG rendering. Built per-render in
-	 * update_text_layer() from PdfDocument::pageTextSpans(). Since Hipe has no client-side
-	 * text-measurement API, spans can't be CSS-scaled to match glyph metrics exactly the
-	 * way PDF.js does -- font-size is approximated from line height, so alignment is
-	 * "good enough to select the right text", not pixel-perfect. */
+	/* An invisible, selectable text overlay in the Acrobat/PDF.js style -- real text nodes
+	 * positioned atop the raster image so the underlying content can be selected, copied
+	 * and searched, without needing DOM-level SVG rendering. Built per-render in
+	 * update_text_layer() from PdfDocument::pageTextSpans(), each line scaled to the width
+	 * it has on the page. */
 	/* Overlay shown while a page is (re-)rendering or if that render fails -- covers
 	 * img_page/text_layer (later in DOM order, plus an explicit z-index for safety) so
 	 * the previous page's now-stale content isn't left on screen with no feedback during
@@ -2116,17 +2239,6 @@ int main(int argc, char** argv) {
 	 * for the label. */
 	hipe_send(session, HIPE_OP_APPEND_TEXT, 0, slideshow_btn, 1, "\xf0\x9f\x92\xbb Slideshow" /* 💻 Slideshow */);
 
-	/* Measured once now that navbar's real content/padding/font-size are all set -- used
-	 * in render_and_show to reserve enough space above the page that scrolling to its top
-	 * doesn't leave it hidden under the floating toolbar. Doesn't need remeasuring later:
-	 * navbar's own height doesn't change across states (button/label text lengths vary
-	 * but not the row height). */
-	{
-		float navbar_h = 0;
-		get_geometry(navbar, nullptr, &navbar_h);
-		navbar_clearance_px = navbar_h + 12.0f; /* + a little breathing room below it */
-	}
-
 	/* Overlay button pair, only shown once slideshow mode hides the sidebar/navbar -- a
 	 * guaranteed way to open the menu or exit that doesn't depend on right-click dialog
 	 * support (which varies by framing manager, see HIPE_OP_DIALOG notes in CLAUDE.md) or
@@ -2203,10 +2315,9 @@ int main(int argc, char** argv) {
 	do {
 		/* Only while slideshow_active does this loop need to wake up on its own (to
 		 * notice the Menu/Leave pair's idle-fade timeout has elapsed with no new event
-		 * having arrived to trigger a check) -- outside slideshow there's nothing to poll
-		 * for, so the normal indefinite blocking wait is used, exactly as before, to avoid
-		 * spending any CPU when nothing is happening (per this project's "lean/efficient"
-		 * goal). blocking=0 returns immediately with 0 if nothing is queued. */
+		 * having arrived to trigger a check) -- outside slideshow there's nothing to wait
+		 * for but the next instruction, so the normal indefinite blocking wait is used.
+		 * blocking=0 returns immediately with 0 if nothing is queued. */
 		short got = hipe_next_instruction(session, &event, slideshow_active ? 0 : 1);
 		/* Per the Hipe API docs: always check for a -1 return (disconnection) or an
 		 * HIPE_OP_SERVER_DENIED opcode and exit -- otherwise an orphaned client (e.g.
@@ -2218,8 +2329,27 @@ int main(int argc, char** argv) {
 		if (got < 0 || (got > 0 && event.opcode == HIPE_OP_SERVER_DENIED))
 			break;
 		if (got == 0) {
+			/* Nothing queued: sleep until the connection has something to read, or until
+			 * the Menu/Leave pair is due to fade (no deadline at all while it's hidden).
+			 * The queue was just found empty, as waiting on hipe_session_fd() requires,
+			 * but the hide below is sent after that check, hence the flush. A readable
+			 * connection may not hold a whole instruction yet; that just brings us round
+			 * to wait again. */
 			check_slideshow_controls_idle_timeout();
-			std::this_thread::sleep_for(std::chrono::milliseconds(150));
+			hipe_flush(session);
+			int timeout_ms = -1;
+			if (slideshow_controls_visible) {
+				auto due = slideshow_controls_last_shown_at + SLIDESHOW_CONTROLS_IDLE_TIMEOUT;
+				auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+					due - std::chrono::steady_clock::now()).count();
+				timeout_ms = (int) std::max<long long>(left, 0) + 1;
+			}
+			struct pollfd pfd = { hipe_session_fd(session), POLLIN, 0 };
+			if (pfd.fd < 0) break;
+			if (poll(&pfd, 1, timeout_ms) < 0 && errno != EINTR) {
+				fprintf(stderr, "poll: %s\n", strerror(errno));
+				break;
+			}
 			continue;
 		}
 

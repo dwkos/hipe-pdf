@@ -26,9 +26,31 @@ layer (`#textLayer` in `main.cpp`, `PdfDocument::pageTextSpans` in `pdf_document
 via MuPDF's structured-text extraction (`fz_new_stext_page_from_page_number`) — one absolutely-positioned,
 `color:transparent` `<span>` per line, real text content, positioned/sized from the line's bbox scaled to
 match the raster. Confirmed working end-to-end (drag-select + copy verified via `xsel --primary` showing
-real extracted text). Known limitation: Hipe has no client-side text-measurement API, so spans can't be
-CSS-scaled to their exact glyph run the way PDF.js does — font-size is approximated from line height, so
-alignment is "close enough to select the right text," not pixel-perfect.
+real extracted text). Font-size is still estimated from line height (the overlay is drawn in the display
+server's sans-serif, not the PDF's own fonts), but each line is then measured with `HIPE_OP_MEASURE_TEXT`
+and scaled horizontally (`transform:scaleX`, as PDF.js does) to the exact width it has on the page — see
+`update_text_layer`. Both ends of every line land within ~1.5px; inside a line the two fonts' letter
+proportions can still differ slightly. `HIPE_PDF_DEBUG=1` logs the measured error per page (via
+`HIPE_OP_GET_RANGE_GEOMETRY`).
+
+**Find in page comes from the framing manager, not this app**: periscope's Find dialog sends
+`HIPE_OP_FIND_TEXT` at the active client's frame, which searches `#textLayer` (the only selectable text —
+`body` is `-webkit-user-select:none`, so the toolbar and labels are skipped). The app's only part is a
+`#textLayer span::search-text` rule making matches a translucent highlight over the raster instead of the
+theme's opaque one. It searches the current page only (the text layer holds one page), and not in
+slideshow (no text layer there) or when running top-level without a framing manager.
+
+## libhipe usage notes
+
+- **Sends are buffered** (`hipe_set_buffered`). libhipe flushes whenever the app waits or checks for an
+  instruction; anywhere else the screen must be current before the app goes quiet — before a blocking
+  `renderPagePng`, or before a `poll()` of its own — needs an explicit `hipe_flush()`.
+- **Locations are freed**: the text and link layers are rebuilt every render, so their elements'
+  locations go back via `clear_and_free()` (`HIPE_OP_CLEAR` alone leaves them allocated on both sides).
+- **Round trips go through `await_reply()`/`reply_float()`**, which survive the server disappearing
+  mid-request (empty reply, `g_should_exit` set) instead of dereferencing a missing argument.
+- **Waiting on our own fds** (slideshow idle fade, FIFO drain) uses `poll()` including
+  `hipe_session_fd()`, after first draining `hipe_next_instruction()` non-blocking, per the libhipe docs.
 
 ## Build
 
@@ -54,11 +76,18 @@ The resulting `build/hipe-pdf` binary is dynamically linked only against `libc`/
 `./build/hipe-pdf <file.pdf>` connects to whatever Hipe session is already running (via the usual
 env-var/keyfile auto-detection in `hipe_open_session`) — it does not start `hiped` itself.
 
-**This machine already runs a live Hipe desktop for interactive use** — `hiped --fill` on
-`DISPLAY=:43` (a nested Xephyr server, not the host's own `:0`/Wayland session), currently running the
-`hipe-quadrant` sample framing manager. Implications for testing:
-- Target that session explicitly: `DISPLAY=:43 ./build/hipe-pdf <file.pdf>` (check
-  `tr '\0' '\n' < /proc/$(pgrep hiped)/environ | grep DISPLAY` if it's moved).
+**This machine already runs a live Hipe desktop for interactive use** — `hiped --fill` on a nested
+Xephyr server (not the host's own `:0`/Wayland session), running a framing manager at top level
+(periscope as of October 2026; `hipe-quadrant` earlier). The display number moves (`:43`, later `:54`),
+and other sessions run their own hiped instances on other displays, so look it up rather than assume;
+`:43` below stands for whichever it currently is. **That desktop is shared with other sessions' work**:
+for anything driven by `xdotool` input, start a private stack instead (`Xephyr :<n> -screen 1024x768 -ac`
+on the host display, then `hiped --fill --socket <path> --keyfile <path>` with `QT_QPA_PLATFORM=xcb` and
+`WAYLAND_DISPLAY` unset, then `periscope --keyfile <path>` with `HIPE_SOCKET`/`HIPE_KEYFILE` pointing at
+that hiped, then hipe-pdf with `HIPE_SOCKET` and `HIPE_KEYFILE=<periscope's keyfile>`). The Xephyr window
+appears on the host desktop, so real mouse/keyboard input can reach it too. Implications for testing:
+- Target that session explicitly: `DISPLAY=:43 ./build/hipe-pdf <file.pdf>` (check each hiped's
+  `tr '\0' '\n' < /proc/<pid>/environ | grep DISPLAY` to find it).
   `scrot`/`grim` against the host's own `:0` will screenshot the *host's* desktop, not Hipe's — confirm
   the right target with `ps aux | grep hiped` and its `/proc/<pid>/environ` first.
   Screenshotting Hipe's own display: `DISPLAY=:43 scrot <path>.png`.
@@ -89,11 +118,11 @@ the hipe.tech site itself, not Hipe API docs.
 Facts pulled from that doc tree relevant to this PDF viewer, since they resolve the README's open
 questions:
 
-- **Canvas is a no-op under hipecore** (`HIPE_OP_USE_CANVAS`/`CANVAS_ACTION`/`CANVAS_SET_PROPERTY` are
-  accepted but do nothing when Hipe is linked against hipecore, which is the recommended/active backend
-  per Hipe's status page). Since Qt5WebKit can't be assumed on the target, **canvas rendering is not a
-  viable path** — pages must be rendered client-side (by this app, not by Hipe) to image bytes and pushed
-  to the DOM.
+- **Canvas works under hipecore since Hipe 2.11** (2D context only, drawn in C++; a raw RGBA buffer can
+  be written with `HIPE_OP_SET_SRC` and mime type `image/x-raw-rgba`). It was a no-op when this app's
+  rendering path was chosen, and the hipe.tech status page may still say so. Considered and declined in
+  October 2026: pages are still rendered client-side to PNG and pushed to an `<img>`, which is simpler
+  and works on both backends.
 - Getting rendered page bytes on screen means: `HIPE_OP_APPEND_TAG` an `<img>` element, then
   `HIPE_OP_SET_SRC` with `arg[0]` = raw image bytes and `arg[1]` = mime type (defaults to `image/png` if
   omitted; any other format, including `image/svg+xml`, must set the mime type explicitly). This settles
@@ -108,8 +137,11 @@ questions:
   on-screen box. Virtualized rendering (only render pages near the viewport) has to be driven by polling/
   reacting to these, since Hipe has no scroll-event notification of its own beyond these query ops.
 - `HIPE_OP_EVENT_REQUEST` (arg0 = DOM event name without "on", e.g. `"click"`) is how slideshow
-  click-to-advance / context-click would be wired up; only one active request per (element, event) pair
-  at a time.
+  click-to-advance / context-click would be wired up. Under hipecore every request adds its own
+  listener (the same event is then reported once per request, even with the same requestor), so cancel
+  with `HIPE_OP_EVENT_CANCEL` before re-requesting; Qt5WebKit keeps one request per (element, event)
+  pair. Optional arg1 (hipecore) lists which matching events have their default action cancelled, e.g.
+  wheel `*,4` for Ctrl+wheel; `contextmenu` is cancelled unless arg1 is `-`.
 - `HIPE_OP_DIALOG` is how the slideshow's context-click popup (next/prev/start/end/leave) would be
   implemented, but **only works if this app runs as a child frame under a framing manager that
   implements dialogs** — a top-level client gets the dialog from Hipe itself, but per the framing-manager
