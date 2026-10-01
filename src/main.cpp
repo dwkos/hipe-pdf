@@ -1215,8 +1215,14 @@ static void request_open_document() {
  * ~/export/export.cpp), so a pure pipe-poll loop would stall here until the 30s cap -- hence
  * the hipe socket is also pumped, non-blocking, each iteration. A FRAME_CLOSE or lost server
  * connection mid-transfer sets g_should_exit and ends the drain; any other instruction that
- * lands during the transfer window is dropped (logged under HIPE_PDF_DEBUG). */
-static std::vector<uint8_t> drain_fifo(int fd, const char* fifo_path, const char* who) {
+ * lands during the transfer window is dropped (logged under HIPE_PDF_DEBUG).
+ *
+ * A FIFO_CLOSE carries the peer's outcome in arg[1]: empty if the transfer ended normally at
+ * its end, otherwise the reason it failed there. On a failure the bytes received so far are
+ * not the whole document, so they are discarded: the result is empty and `failure` holds the
+ * peer's reason. */
+static std::vector<uint8_t> drain_fifo(int fd, const char* fifo_path, const char* who, std::string& failure) {
+	failure.clear();
 	std::vector<uint8_t> bytes;
 	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
 	uint8_t chunk[64 * 1024];
@@ -1248,6 +1254,8 @@ static std::vector<uint8_t> drain_fifo(int fd, const char* fifo_path, const char
 				&& tmp.arg[0] && fifo_path && strcmp(tmp.arg[0], fifo_path) == 0;
 			if (close_sig) {
 				peer_closed = true;
+				if (tmp.opcode == HIPE_OP_FIFO_CLOSE && tmp.arg[1] && tmp.arg_length[1])
+					failure.assign(tmp.arg[1], tmp.arg_length[1]);
 			} else if (tmp.opcode == HIPE_OP_FRAME_CLOSE) {
 				g_should_exit = true;
 				peer_closed = true;
@@ -1262,6 +1270,11 @@ static std::vector<uint8_t> drain_fifo(int fd, const char* fifo_path, const char
 	}
 	hipe_instruction_clear(&tmp);
 
+	if (!failure.empty()) {
+		fprintf(stderr, "%s: the other app reported a failed transfer: %s\n", who, failure.c_str());
+		return {};
+	}
+
 	/* On a FIFO_CLOSE signal the last bytes are already in the pipe buffer (the peer wrote
 	 * everything before sending it, and the instruction crosses the relay slower than the
 	 * bytes cross the kernel) -- sweep whatever is readable now. */
@@ -1273,17 +1286,62 @@ static std::vector<uint8_t> drain_fifo(int fd, const char* fifo_path, const char
 	return bytes;
 }
 
+/* Waits for the host's answer to the FIFO_OPEN we sent for `fifo_path`. Returns true once the
+ * host relays the FIFO_OPEN back (its end is open). Returns false if no transfer was opened:
+ * the host refused with a FIFO_CLOSE (its reason, from arg[1], is logged), the peer was
+ * dropped, we are closing, or nothing came back within 30s (a framing manager that doesn't
+ * relay the handshake, or a host that never answers). As in drain_fifo(), any other
+ * instruction that lands in this window is dropped. */
+static bool await_fifo_open_echo(const char* fifo_path) {
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+	hipe_instruction tmp;
+	hipe_instruction_init(&tmp);
+	bool opened = false, done = false;
+
+	while (!done) {
+		short got;
+		while (!done && (got = hipe_next_instruction(session, &tmp, 0)) != 0) {
+			if (got < 0) { g_should_exit = true; done = true; break; }
+			bool ours = tmp.arg[0] && strcmp(tmp.arg[0], fifo_path) == 0;
+			if (tmp.opcode == HIPE_OP_FIFO_OPEN && ours) {
+				opened = done = true;
+			} else if (tmp.opcode == HIPE_OP_FIFO_CLOSE && ours) {
+				fprintf(stderr, "read_fifo_resource: the other app refused to open '%s': %.*s\n", fifo_path,
+					(int) tmp.arg_length[1], tmp.arg[1] ? tmp.arg[1] : "");
+				done = true;
+			} else if (tmp.opcode == HIPE_OP_FIFO_DROP_PEER && ours) {
+				fprintf(stderr, "read_fifo_resource: the other app ended the connection for '%s'\n", fifo_path);
+				done = true;
+			} else if (tmp.opcode == HIPE_OP_FRAME_CLOSE) {
+				g_should_exit = true;
+				done = true;
+			} else {
+				DBG("read_fifo_resource: dropped instruction opcode=%d while awaiting FIFO_OPEN\n", (int) tmp.opcode);
+			}
+		}
+		if (done) break;
+		if (std::chrono::steady_clock::now() > deadline) {
+			fprintf(stderr, "read_fifo_resource: no answer to FIFO_OPEN for '%s' after 30s\n", fifo_path);
+			break;
+		}
+		struct pollfd pfd = { hipe_session_fd(session), POLLIN, 0 };
+		if (pfd.fd < 0) { g_should_exit = true; break; }
+		if (poll(&pfd, 1, 200) < 0 && errno != EINTR) {
+			fprintf(stderr, "read_fifo_resource: poll: %s\n", strerror(errno));
+			break;
+		}
+	}
+	hipe_instruction_clear(&tmp);
+	return opened;
+}
+
 /* Reads a whole FIFO resource (named pipe) into memory as the FIFO *client*, running the
  * client side of the HIPE_OP_FIFO_OPEN handshake. Returns the bytes, or an empty vector on
  * any failure.
  *
  * Synchronous, like the other request/response exchanges in this file (get_geometry() etc.):
- * a slow mediated transfer blocks the client the same way a slow page render already does.
- * Known gap: the FIFO_OPEN echo below depends on the framing manager relaying the
- * instruction in both directions. A manager that answers FIFO_GET_PEER but never relays the
- * open handshake would leave hipe_await_instruction() blocked here. periscope -- the only
- * framing manager this runs under -- is expected to implement it; if that proves fragile
- * this should move into the main loop as a small state machine. */
+ * a slow mediated transfer blocks the client the same way a slow page render already does,
+ * but never for more than 30s per stage (see await_fifo_open_echo() and drain_fifo()). */
 static std::vector<uint8_t> read_fifo_resource(const char* fifo_path) {
 	/* Reader opens first, non-blocking so open() succeeds even though no writer has
 	 * attached yet (a blocking open would deadlock: the host only opens its write end in
@@ -1297,13 +1355,16 @@ static std::vector<uint8_t> read_fifo_resource(const char* fifo_path) {
 	DBG("client: pipe %s open, sent FIFO_OPEN, awaiting host echo\n", fifo_path);
 	hipe_send(session, HIPE_OP_FIFO_OPEN, 0, 0, 2, fifo_path, "r");
 
-	hipe_instruction ack;
-	hipe_instruction_init(&ack);
-	hipe_await_instruction(session, &ack, HIPE_OP_FIFO_OPEN); /* host's "my write end is open" echo */
-	hipe_instruction_clear(&ack);
+	if (!await_fifo_open_echo(fifo_path)) {
+		/* No transfer was opened, so there is no FIFO_CLOSE to answer; just let the peer go. */
+		close(fd);
+		hipe_send(session, HIPE_OP_FIFO_DROP_PEER, 0, 0, 1, fifo_path);
+		return {};
+	}
 	DBG("client: got host FIFO_OPEN echo, draining\n");
 
-	std::vector<uint8_t> bytes = drain_fifo(fd, fifo_path, "read_fifo_resource");
+	std::string failure;
+	std::vector<uint8_t> bytes = drain_fifo(fd, fifo_path, "read_fifo_resource", failure);
 	close(fd);
 	DBG("client: drained %zu bytes\n", bytes.size());
 
@@ -1313,6 +1374,7 @@ static std::vector<uint8_t> read_fifo_resource(const char* fifo_path) {
 	hipe_send(session, HIPE_OP_FIFO_DROP_PEER, 0, 0, 1, fifo_path);
 	return bytes;
 }
+
 
 static void handle_fifo_response(const hipe_instruction& ev) {
 	const char* path = ev.arg[0];
@@ -1427,24 +1489,43 @@ static void handle_incoming_fifo_get_peer(const hipe_instruction& ev) {
 	hipe_send(session, HIPE_OP_FIFO_OPEN, 0, 0, 2, path, "w"); /* our read end is open */
 	DBG("read end open, echoed FIFO_OPEN; draining pipe (30s cap)\n");
 
-	std::vector<uint8_t> bytes = drain_fifo(fd, path, "fifo host");
+	std::string failure;
+	std::vector<uint8_t> bytes = drain_fifo(fd, path, "fifo host", failure);
 	close(fd);
 	DBG("drained %zu bytes\n", bytes.size());
 
-	hipe_send(session, HIPE_OP_FIFO_CLOSE, 0, 0, 1, path);
+	/* Our FIFO_CLOSE tells the sender, in arg[1], whether the document arrived and could be
+	 * opened: empty if so, otherwise why not. So the document is parsed before answering. If
+	 * the sender itself gave up (`failure`), there is nothing of ours to report. */
+	std::unique_ptr<PdfDocument> received;
+	std::string outcome;
+	if (failure.empty()) {
+		if (bytes.empty()) {
+			outcome = "No data was received";
+		} else {
+			try {
+				received = std::make_unique<PdfDocument>(bytes, ".pdf");
+			} catch (const std::exception& e) {
+				outcome = e.what();
+			}
+		}
+		if (!outcome.empty())
+			fprintf(stderr, "fifo host: could not open '%s': %s\n", display_name.c_str(), outcome.c_str());
+	}
+
+	hipe_send(session, HIPE_OP_FIFO_CLOSE, 0, 0, 2, path, outcome.c_str());
 	hipe_send(session, HIPE_OP_FIFO_DROP_PEER, 0, 0, 1, path);
 	unlink(path);
 	host_fifo_path.clear();
 
-	if (bytes.empty()) {
-		fprintf(stderr, "fifo host: no data received for '%s'\n", display_name.c_str());
+	if (!received) {
 		if (!doc) show_empty_state();
 		return;
 	}
 	try {
-		accept_document(std::make_unique<PdfDocument>(bytes, ".pdf"), display_name);
+		accept_document(std::move(received), display_name);
 	} catch (const std::exception& e) {
-		fprintf(stderr, "fifo host: failed to load received document: %s\n", e.what());
+		fprintf(stderr, "fifo host: failed to show received document: %s\n", e.what());
 		if (!doc) show_empty_state();
 	}
 }
