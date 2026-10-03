@@ -76,6 +76,19 @@
 #define KEY_HOME 36
 #define KEY_ARROWUP 38
 #define KEY_ARROWDOWN 40
+/* The zoom shortcuts: Ctrl with + / - / 0, on the main keys or the number pad. The main
+ * "+" key is "=" unshifted, so Ctrl+= and Ctrl+Shift+= both count as Ctrl-plus. */
+#define KEY_0 48
+#define KEY_NUMPAD_0 96
+#define KEY_NUMPAD_ADD 107
+#define KEY_NUMPAD_SUBTRACT 109
+#define KEY_EQUALS 187
+#define KEY_MINUS 189
+
+/* Modifier mask carried in event details (see HIPE_OP_EVENT): 1 = Shift, 2 = Alt, 4 = Ctrl,
+ * 8 = Meta, added together. */
+#define MOD_SHIFT 1
+#define MOD_CTRL 4
 
 static const float ARROW_SCROLL_STEP_PX = 60.0f;
 static const float THUMB_WIDTH_PX = 110.0f;
@@ -872,14 +885,20 @@ static const auto WHEEL_NO_SCROLL_COOLDOWN = std::chrono::milliseconds(500);
 static const auto WHEEL_RENDER_SETTLE = std::chrono::milliseconds(300);
 
 /* wheel event details are "deltaX,deltaY,deltaMode,modifiers" (see HIPE_OP_EVENT). The
- * server adds up the deltas of a fast burst into one event, but only the sign of deltaY
- * matters here, regardless of size or deltaMode (pixel/line/page), so no unit conversion
- * is needed. */
-static float parse_wheel_delta_y(const char* details) {
-	if (!details) return 0.0f;
-	const char* comma = strchr(details, ',');
-	if (!comma) return 0.0f;
-	return atof(comma + 1);
+ * server adds up the deltas of a fast burst into one event. Page-turning only looks at the
+ * sign of deltaY, whatever its size or deltaMode (pixel/line/page); Ctrl+wheel zoom uses
+ * the size too, see wheel_zoom_notches(). */
+struct WheelDetail {
+	float delta_y = 0.0f;
+	int delta_mode = 0;
+	int modifiers = 0;
+};
+
+static WheelDetail parse_wheel_detail(const char* details) {
+	WheelDetail w;
+	float delta_x = 0.0f;
+	if (details) sscanf(details, "%f,%f,%d,%d", &delta_x, &w.delta_y, &w.delta_mode, &w.modifiers);
+	return w;
 }
 
 static void handle_wheel_event(float delta_y) {
@@ -989,6 +1008,28 @@ static void set_fit_mode(FitMode mode) {
 	render_and_show(current_page);
 	update_zoom_label();
 }
+
+/* Zooms by a number of ZOOM_STEPs (negative zooms out; fractions are fine), from wherever
+ * the zoom currently is -- including under a fit mode, which this then leaves, as the
+ * toolbar's own zoom buttons do. Already at the limit in that direction: nothing to
+ * re-render. */
+static void zoom_by_steps(float steps) {
+	float target = std::max(ZOOM_MIN, std::min(ZOOM_MAX, zoom_level * std::pow(ZOOM_STEP, steps)));
+	if (fit_mode == FitMode::NONE && std::fabs(target - zoom_level) < 0.001f) return;
+	set_zoom(target);
+}
+
+/* How many zoom steps a Ctrl+wheel event is worth: one per notch, wheel-up zooming in. The
+ * server may have added several notches into one event, and some mice send a notch as
+ * several smaller deltas, so this goes by the size of the delta rather than counting
+ * events. A notch is taken as 60 pixels or 3 lines; in page mode each unit is one. */
+static float wheel_zoom_notches(const WheelDetail& w) {
+	float per_notch = (w.delta_mode == 0) ? 60.0f : (w.delta_mode == 1) ? 3.0f : 1.0f;
+	return -w.delta_y / per_notch;
+}
+
+/* Ctrl+wheel notches collected but not yet applied -- see REQ_WHEEL in dispatch_event(). */
+static float pending_zoom_notches = 0.0f;
 
 static void toggle_sidebar() {
 	sidebar_visible = !sidebar_visible;
@@ -1723,7 +1764,20 @@ static void dispatch_event(hipe_instruction& event, bool embedded_mode) {
 	else if (event.requestor == REQ_SLIDESHOW_MENU && slideshow_active) show_slideshow_dialog();
 	else if (event.requestor == REQ_SLIDESHOW_MOUSEMOVE && slideshow_active) reveal_slideshow_controls();
 	else if (event.requestor == REQ_KEYDOWN) {
-		switch (event.arg[1] ? atoi(event.arg[1]) : 0) {
+		/* keydown details are "keyCode,modifiers". */
+		int key = 0, modifiers = 0;
+		if (event.arg[1]) sscanf(event.arg[1], "%d,%d", &key, &modifiers);
+		if ((modifiers & ~MOD_SHIFT) == MOD_CTRL) {
+			/* Zoom shortcuts. Not in slideshow, which keeps the slide fitted to the frame
+			 * (and has the zoom buttons hidden along with the rest of the toolbar). */
+			if (slideshow_active) { /* nothing */ }
+			else if (key == KEY_EQUALS || key == KEY_NUMPAD_ADD) zoom_by_steps(1.0f);
+			else if (key == KEY_MINUS || key == KEY_NUMPAD_SUBTRACT) zoom_by_steps(-1.0f);
+			else if (key == KEY_0 || key == KEY_NUMPAD_0) {
+				if (fit_mode != FitMode::NONE || std::fabs(zoom_level - 1.0f) >= 0.001f) set_zoom(1.0f);
+			}
+		}
+		else switch (key) {
 			case KEY_PAGEUP: render_and_show(current_page - 1, true); break;
 			case KEY_PAGEDOWN: render_and_show(current_page + 1); break;
 			case KEY_HOME: render_and_show(0); break;
@@ -1732,7 +1786,34 @@ static void dispatch_event(hipe_instruction& event, bool embedded_mode) {
 			case KEY_ARROWDOWN: handle_arrow_key(true); break;
 		}
 	}
-	else if (event.requestor == REQ_WHEEL) handle_wheel_event(parse_wheel_delta_y(event.arg[1]));
+	else if (event.requestor == REQ_WHEEL) {
+		WheelDetail wheel = parse_wheel_detail(event.arg[1]);
+		if (wheel.modifiers != MOD_CTRL) {
+			handle_wheel_event(wheel.delta_y);
+		} else if (!slideshow_active) {
+			/* Ctrl+wheel zooms (its scrolling is cancelled where the event is requested,
+			 * see main()). Every zoom is a full re-render, so a spin that outruns the
+			 * renderer is handled the way a run of resizes is below: add this event's
+			 * notches to the total, and only zoom once the next instruction isn't more
+			 * of the same. */
+			pending_zoom_notches += wheel_zoom_notches(wheel);
+			hipe_instruction next;
+			hipe_instruction_init(&next);
+			short got = hipe_next_instruction(session, &next, /*blocking=*/0);
+			bool more_zoom = got > 0 && next.opcode == HIPE_OP_EVENT && next.requestor == REQ_WHEEL
+				&& parse_wheel_detail(next.arg[1]).modifiers == MOD_CTRL;
+			if (more_zoom) {
+				dispatch_event(next, embedded_mode);
+			} else {
+				float notches = pending_zoom_notches;
+				pending_zoom_notches = 0.0f;
+				zoom_by_steps(notches);
+				if (got > 0) dispatch_event(next, embedded_mode); /* whatever followed, in arrival order */
+				else if (got < 0) g_should_exit = true;
+			}
+			hipe_instruction_clear(&next);
+		}
+	}
 	else if (event.requestor == REQ_RESIZE && fit_mode != FitMode::NONE) {
 		hipe_instruction next;
 		hipe_instruction_init(&next);
@@ -2293,7 +2374,10 @@ int main(int argc, char** argv) {
 	 * comment there (matches "contextmenu"'s existing pattern: only meaningful while
 	 * actually in slideshow). */
 	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_KEYDOWN, 0, 1, "keydown"); /* location 0 = whole-frame keydown */
-	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_WHEEL, viewport, 1, "wheel");
+	/* arg1 "*,4": cancel the default action (scrolling) of a wheel event with exactly Ctrl
+	 * held, which zooms instead -- see REQ_WHEEL in dispatch_event(). A plain wheel still
+	 * scrolls natively. */
+	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_WHEEL, viewport, 2, "wheel", "*,4");
 	/* "resize" is special-cased server-side to attach to the window regardless of the
 	 * location given (see requestEvent() in hipecore's qwebelement.cpp), so location is
 	 * arbitrary here -- 0 to match the other whole-frame requests above. */

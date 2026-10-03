@@ -5,7 +5,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project status
 
 Scaffold + MVP single-page viewing + thumbnail sidebar (auto-scrolls to keep the current page's
-thumbnail in view) + zoom (with Fit Width/Fit Page modes) + slideshow mode implemented (see
+thumbnail in view) + zoom (with Fit Width/Fit Page modes; also Ctrl+wheel and Ctrl +/-/0, not in
+slideshow) + slideshow mode implemented (see
 `.claude/plans` history / git log for the phased roadmap), plus keyboard navigation
 (PageUp/PageDown/Home/End/arrows), scroll-wheel page-turning at scroll limits, and an invisible
 selectable-text overlay atop the raster render (Acrobat/PDF.js style — see "Text rendering approach"
