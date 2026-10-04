@@ -44,6 +44,28 @@ The resulting `build/hipe-pdf` statically links MuPDF and libhipe; only libc/lib
 remain dynamic (verify with `ldd build/hipe-pdf`).
 
 
+## Features
+
+- **Page view** with a sidebar of page thumbnails (which can be hidden), and a busy cursor and
+  "Loading..." placeholder while a slow page renders. A page too complex to render in time is
+  shown at a lower resolution instead.
+- **Navigation:** toolbar buttons, PageUp/PageDown/Home/End, the arrow keys, clicking a
+  thumbnail, and the scroll wheel, which turns the page when you're already at its top or
+  bottom.
+- **Zoom:** toolbar buttons, Fit Width and Fit Page, Ctrl+wheel, and Ctrl +, Ctrl - and Ctrl 0.
+  Clicking the zoom percentage resets it to 100%.
+- **Selectable text:** page text can be selected and copied, and a framing manager's Find (such
+  as periscope's) searches it.
+- **Links:** links within the document jump to their page; links to web pages are opened
+  through Hipe (`HIPE_OP_OPEN_LINK`).
+- **Slideshow:** the page fills the frame, against a background matched to the slide. Click to
+  advance. A right-click, or the Menu button that appears when the mouse moves, opens a menu
+  (previous, next, start, end, leave) showing the slide number, the time, and how long the
+  talk and the current slide have run.
+- **Opening documents:** from the command line, with the Open button, or sent from another
+  app ("open with...").
+
+
 ## Running
 
 ```sh
@@ -64,17 +86,3 @@ binary is distributed under the AGPL version 3 or later as a whole
 (`licenses/AGPL-3.0.txt`). See `LICENSE.md` for the details, for the libraries and fonts
 inside the binary, and for `make source-bundle`, which packages the source to publish with a
 binary.
-
-Wishlist for features:
-- A sidebar to allow page thumbnails to be navigated. Page thumbnails should be rendered as lean as possible; efficiency over aesthetics to a certain point.
-
-- zooming of current page
-
-- A slideshow button to allow current page to occupy full frame, click to advance to next page, context-click to pop up dialog allowing next page, prev page, start, end, leave slideshow.
-
-- Use SVG rendering. Hipe may or may not yet support DOM SVGs vs existing support for <img>s with svg byte data at time of implementation.
-
-- eventual continuous scrolling allowing one page to appear to follow the next linearly, but not actually rendering pages outside the current scroll view.
-
-
-

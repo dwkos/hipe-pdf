@@ -10,7 +10,8 @@ slideshow) + slideshow mode implemented (see
 `.claude/plans` history / git log for the phased roadmap), plus keyboard navigation
 (PageUp/PageDown/Home/End/arrows), scroll-wheel page-turning at scroll limits, and an invisible
 selectable-text overlay atop the raster render (Acrobat/PDF.js style — see "Text rendering approach"
-below). Not yet implemented: continuous scroll (the README's other stretch goal).
+below). The README's original wishlist is done, apart from continuous scroll and SVG rendering, which were
+decided against (see "Project intent" below).
 
 Note: `HIPE_OP_GET_GEOMETRY` reports a scroll-independent position — it does not change as an ancestor
 element is scrolled (confirmed empirically; see `scroll_thumbnail_into_view` in `main.cpp`). Any future
@@ -163,12 +164,11 @@ A minimal PDF viewer for the Hipe display server, written in C++. Key constraint
 - The Hipe API is the main dependency; avoid other dynamic dependencies to maximize portability.
 - Prefer lean/efficient implementations over aesthetics where the two trade off (e.g. thumbnail rendering).
 
-Planned features (not yet implemented):
-- Sidebar with page thumbnails, rendered as cheaply as possible.
-- Zoom on the current page.
-- Slideshow mode: current page fills the frame; click advances to the next page; context-click opens a
-  dialog with next/prev/start/end/leave-slideshow options.
-- SVG rendering for pages — note Hipe's DOM SVG support is unconfirmed as of this writing, so this may
-  need to fall back to `<img>` tags with SVG byte data depending on what Hipe supports when implemented.
-- Continuous scrolling that visually follows page-to-page but only renders pages within the current
-  scroll viewport (i.e. virtualized rendering, not full-document rendering).
+The README's original wishlist, and what became of it (the wishlist itself was removed from the README in
+October 2026, once the README became the public GitHub page):
+- Thumbnail sidebar, zoom, slideshow with a context-click menu: done.
+- SVG rendering: dropped in favour of raster PNG plus an invisible text layer (see "Text rendering
+  approach").
+- Continuous scrolling with virtualized rendering (only pages near the viewport rendered): decided
+  against -- it would complicate the single-page design (rendering, text/link layers, slideshow, wheel
+  page-turning) for little gain.
