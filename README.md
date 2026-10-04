@@ -56,6 +56,15 @@ mechanism: a native file dialog when running top-level, or a framing-manager-med
 shell when running framed.
 
 
+## Licence
+
+hipe-pdf's own code is licensed under the GNU GPL, version 3 or later (`COPYING`). It is
+built with MuPDF, which is licensed under the GNU AGPL, version 3 or later, so a hipe-pdf
+binary is distributed under the AGPL version 3 or later as a whole
+(`licenses/AGPL-3.0.txt`). See `LICENSE.md` for the details, for the libraries and fonts
+inside the binary, and for `make source-bundle`, which packages the source to publish with a
+binary.
+
 Wishlist for features:
 - A sidebar to allow page thumbnails to be navigated. Page thumbnails should be rendered as lean as possible; efficiency over aesthetics to a certain point.
 

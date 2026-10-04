@@ -1,3 +1,8 @@
+# Copyright (c) 2026 Daniel Kos
+#
+# This file is part of hipe-pdf, licensed under the GNU General Public License
+# version 3 or later. See COPYING and LICENSE.md.
+
 import os
 import math
 from PIL import Image, ImageDraw, ImageFilter

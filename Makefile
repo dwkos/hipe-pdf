@@ -1,3 +1,8 @@
+# Copyright (c) 2026 Daniel Kos
+#
+# This file is part of hipe-pdf, licensed under the GNU General Public License
+# version 3 or later. See COPYING and LICENSE.md.
+
 CXX?=g++
 
 MUPDF_DIR=third_party/mupdf
@@ -35,4 +40,9 @@ clean-third-party:
 
 distclean: clean clean-third-party
 
-.PHONY: all clean clean-third-party distclean third-party
+# The complete source of a binary built from the current commit, MuPDF included, to publish
+# next to it -- see scripts/source-bundle.sh and LICENSE.md.
+source-bundle:
+	scripts/source-bundle.sh build
+
+.PHONY: all clean clean-third-party distclean third-party source-bundle
