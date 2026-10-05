@@ -65,6 +65,8 @@
  * opcode == HIPE_OP_FIFO_RESPONSE, since an unrelated instruction could carry any requestor
  * (see the loop's own note about requestor collisions). */
 #define REQ_FIFO_GET_PDF 19
+#define REQ_ABOUT 20        /* "About" toolbar button */
+#define REQ_ABOUT_DIALOG 21
 #define REQ_THUMB_BASE 1000
 /* Far above REQ_THUMB_BASE's own range (REQ_THUMB_BASE + page_count) so the two ranges
  * can never collide regardless of document length -- see update_link_layer/dispatch. */
@@ -1212,6 +1214,25 @@ static void handle_slideshow_dialog_return(const hipe_instruction& reply) {
 	}
 }
 
+/* The About box: a one-button HIPE_OP_DIALOG summarising the licensing (see LICENSE.md) and
+ * where the source is -- the AGPL obliges a binary to offer its source to its users, and this
+ * is where a user of the program can find that out. Its DIALOG_RETURN needs no handling.
+ * Deliberately generic ("PDF Viewer", no mention of hipe-pdf or Hipe): a distro presents the
+ * app under its own branding, and the display server is an implementation detail to the user. */
+static void show_about_dialog() {
+	hipe_send(session, HIPE_OP_DIALOG, REQ_ABOUT_DIALOG, 0, 4,
+		"About PDF Viewer",
+		"PDF Viewer\n"
+		"Copyright \xc2\xa9 2026 Daniel Kos\n\n"
+		"This program is free software. Its own code is licensed under the GNU General Public "
+		"License, version 3 or later. It is built with the MuPDF library, licensed under the "
+		"GNU Affero General Public License, version 3 or later, so this program as a whole is "
+		"distributed under the GNU AGPL, version 3 or later. It comes with NO WARRANTY.\n\n"
+		"Source code: https://github.com/dwkos/hipe-pdf",
+		"OK",
+		"\n\xe2\x84\xb9" /* no symbol for OK; U+2139 \xe2\x84\xb9 for the dialog */);
+}
+
 static void build_thumbnail_sidebar(hipe_loc sidebar) {
 	/* Eagerly rendered up front; fine for typical documents. A lazy,
 	 * scroll-driven variant (matching the continuous-scroll stretch goal)
@@ -1327,7 +1348,7 @@ static void swap_in_document(std::unique_ptr<PdfDocument> new_doc, const std::st
 	hide_empty_state();
 
 	if (!display_name.empty()) {
-		std::string title = "hipe-pdf \xe2\x80\x94 " + display_name;
+		std::string title = "PDF Viewer \xe2\x80\x94 " + display_name;
 		hipe_send(session, HIPE_OP_SET_TITLE, 0, 0, 1, title.c_str());
 	}
 
@@ -1767,8 +1788,9 @@ static void dispatch_event(hipe_instruction& event, bool embedded_mode) {
 	 * EVENT_REQUESTs -- other instruction types can carry unrelated
 	 * requestor values that happen to collide with our REQ_* codes. */
 	if (event.requestor == REQ_OPEN) request_open_document();
+	else if (event.requestor == REQ_ABOUT) show_about_dialog();
 	/* Every other action needs a loaded document. With none (the no-file launch mode,
-	 * before the first Open), the toolbar isn't shown and #emptyState only emits
+	 * before the first Open), only Open and About do anything and #emptyState only emits
 	 * REQ_OPEN -- but guard anyway so a stray event can't reach code that dereferences
 	 * doc. */
 	else if (!doc) { /* nothing */ }
@@ -2341,6 +2363,13 @@ int main(int argc, char** argv) {
 	 * The desktop-computer glyph in front is just a visual cue, not a replacement
 	 * for the label. */
 	hipe_send(session, HIPE_OP_APPEND_TEXT, 0, slideshow_btn, 1, "\xf0\x9f\x92\xbb Slideshow" /* 💻 Slideshow */);
+
+	/* Rightmost: About (licensing and source link, see show_about_dialog). */
+	hipe_send(session, HIPE_OP_APPEND_TAG, 0, navbar, 2, "button", "aboutBtn");
+	hipe_loc about_btn = get_by_id("aboutBtn");
+	hipe_send(session, HIPE_OP_APPEND_TEXT, 0, about_btn, 1, "\xe2\x84\xb9" /* ℹ */);
+	hipe_send(session, HIPE_OP_SET_STYLE, 0, about_btn, 2, "margin-left", GROUP_MARGIN);
+	hipe_send(session, HIPE_OP_EVENT_REQUEST, REQ_ABOUT, about_btn, 1, "click");
 
 	/* Overlay button pair, only shown once slideshow mode hides the sidebar/navbar -- a
 	 * guaranteed way to open the menu or exit that doesn't depend on right-click dialog
